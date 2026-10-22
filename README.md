@@ -80,8 +80,14 @@ Un archivo de tu clima: eliges **cualquier fecha desde 1950** (◀ ▶, día/mes
 Para esto el historial diario ahora trae máxima, mínima y lluvia (antes solo la media), y los
 días son **de tu hora**, no de la UTC (el 1 de enero es tu 1 de enero). Cuesta lo mismo en la
 API, pero **la primera vez vuelve a descargar el historial desde 1950** (unos minutos, en
-segundo plano). Mientras tanto, y sin internet, el almanaque ya enseña el sol, la luna y lo que
-guardó Clima Pi.
+segundo plano). Se hace en la **primera actualización** (o al pulsar «Actualizar ahora»), sin
+esperar al reentrenamiento diario; mientras tanto el almanaque dice que está descargando, y sin
+internet lo dice y lo reintenta en cuanto vuelve. Ya enseña el sol, la luna y lo que guardó
+Clima Pi.
+
+*2.8.1:* en la 2.8 el historial nuevo solo se descargaba al reentrenar (una vez al día), así
+que tras actualizar con el modelo ya entrenado el almanaque salía vacío. Ahora se descarga en
+cuanto falta, está incompleto o va atrasado.
 
 ## Qué cambió en la versión 2.7: modelos de inteligencia artificial
 
@@ -243,7 +249,7 @@ pestaña Precisión y con `--backtest` (y la del sensor, en el registro «En viv
 python3 -m unittest discover -s tests -v
 ```
 
-78 pruebas, sin red, sin ventana y sin sensor de verdad (un DHT22 simulado con los archivos
+82 pruebas, sin red, sin ventana y sin sensor de verdad (un DHT22 simulado con los archivos
 que crea Linux), en ~30 s. Usan un mundo meteorológico sintético con el formato exacto de
 las respuestas de Open-Meteo (`tests/sintetico.py`): 11 modelos con su sesgo, su sesgo
 día/noche que cambia con la estación, error que crece con la antelación (en parte común a

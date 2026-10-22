@@ -493,7 +493,7 @@ def extras_forecast(loc):
 
 # ---------------------------------------------------------------- segundo plano, arranque e icono
 APP_ID = "clima-pi"
-APP_VERSION = "2.8"                         # si arranca una versión distinta, sustituye a la que corre
+APP_VERSION = "2.8.1"                         # si arranca una versión distinta, sustituye a la que corre
 WM_CLASS = "Clima-pi"                       # Tk pone en mayúscula la 1ª letra de className
 TRAY_PKGS = "gir1.2-ayatanaappindicator3-0.1 python3-gi python3-pil"
 
@@ -2558,6 +2558,18 @@ def _same_date(y, m, d):
         return date(y, m, 28)
 
 
+def archive_status(arch, today):
+    """¿Sirve el historial para el almanaque? "ok", "vacío", "antiguo" (de la 2.7: solo la media)
+    o "atrasado" (le faltan las últimas semanas)."""
+    if not arch:
+        return "vacío"
+    if not any("tmax" in v for v in arch.values()):
+        return "antiguo"
+    if max(arch) < today - timedelta(days=30):        # ERA5 va ~5 días por detrás: margen de sobra
+        return "atrasado"
+    return "ok"
+
+
 def normals_table(arch, years=NORMAL_YEARS, window=3):
     """Lo normal para cada día del año: media de ±window días en el periodo de referencia.
 
@@ -3047,6 +3059,7 @@ class App:
         self.warnings = []
         self.last = None
         self.archive, self.normals = {}, None
+        self.archive_loading, self.archive_error = False, None
         self.f_small = tkfont.Font(family=FONT, size=9)
         self._style()
         self._build()
@@ -3822,8 +3835,12 @@ class App:
         self.forecast_at = now
         if retrain:
             self.trained_at = now
-        threading.Thread(target=self._job, args=(dict(self.loc), self.key(), retrain, self.trained),
-                         daemon=True).start()
+        need_archive = archive_status(self.archive, datetime.now(self.tz).date()) != "ok"
+        if need_archive:
+            self.archive_loading, self.archive_error = True, None
+            self.show_almanac()
+        threading.Thread(target=self._job, args=(dict(self.loc), self.key(), retrain, self.trained,
+                                                 need_archive), daemon=True).start()
 
     def _load_archive(self, loc, key):
         """El historial diario que ya está en el disco (sirve también sin internet)."""
@@ -3831,11 +3848,11 @@ class App:
             cached = _load_json(os.path.join(loc_dir(loc), "era5_diario.json"))
             if cached:
                 tz = get_tz(loc)
-                self.q.put(("history", (climate_history(cached, tz), daily_archive(cached, tz)), key))
+                self.q.put(("history", (climate_history(cached, tz), daily_archive(cached, tz), False), key))
         except Exception as e:                      # un archivo raro no debe parar nada
             log(f"Historial en disco ilegible: {e}", "warn")
 
-    def _job(self, loc, key, retrain, trained):
+    def _job(self, loc, key, retrain, trained, need_archive=False):
         q = self.q
         t_job = time.perf_counter()
         log(f"══ ACTUALIZACIÓN {'con reentrenamiento ' if retrain else ''}· {loc_name(loc)} "
@@ -3845,6 +3862,8 @@ class App:
             sensor = sensor_available()
             forced = OFFLINE_FORCED or bool(settings().get("offline"))
             if forced or not online():
+                if need_archive:                    # antes: el pronóstico sin red puede fallar
+                    q.put(("history_err", "sin conexión a internet", key))
                 self._offline_job(loc, key, tz, trained, sensor, forced, retrain)
                 log(f"══ Actualización terminada en {time.perf_counter() - t_job:.1f} s", "head")
                 q.put(("done", None, key))
@@ -3913,11 +3932,14 @@ class App:
                 res.setdefault("pi_past", {})
             q.put(("forecast", res, key))
 
-            if retrain:
+            # el historial diario (Clima histórico y Almanaque): al reentrenar, y siempre que el
+            # guardado no sirva (no existe, es de una versión anterior o va atrasado)
+            if retrain or need_archive:
                 try:
-                    q.put(("status", "Descargando clima diario desde 1950 (solo la 1ª vez tarda)…", key))
+                    q.put(("status", "Descargando el historial diario desde 1950 para el almanaque "
+                                     "(solo la 1ª vez tarda unos minutos)…", key))
                     daily = era5_daily(loc)
-                    q.put(("history", (climate_history(daily, tz), daily_archive(daily, tz)), key))
+                    q.put(("history", (climate_history(daily, tz), daily_archive(daily, tz), True), key))
                 except Exception as e:
                     q.put(("history_err", str(e), key))
             log(f"══ Actualización terminada en {time.perf_counter() - t_job:.1f} s", "head")
@@ -4047,11 +4069,15 @@ class App:
             self.acc_chart.message(f"No se pudo entrenar: {data}\nLo reintento en 30 minutos.")
             self.warnings.append(f"entrenamiento: {data}")
         elif kind == "history":
-            hist, self.archive = data
+            hist, self.archive, downloaded = data
             self.normals = None                     # se recalculan al mirar el almanaque
+            if downloaded:                          # (el del disco llega antes y no termina nada)
+                self.archive_loading, self.archive_error = False, None
             self.show_history(hist)
             self.show_almanac()
         elif kind == "history_err":
+            self.archive_loading, self.archive_error = False, data
+            self.show_almanac()
             self.hist_chart.message(f"No se pudo descargar el historial: {data}")
         elif kind == "retrain_later":           # sin red no se puede reentrenar: probar luego
             self.trained_at = time.time() - RETRAIN_EVERY_S + 900
@@ -4523,6 +4549,21 @@ class App:
             sec["day"].config(text="Elige primero tu ciudad.")
             return
         arch = self.archive or {}
+        status = archive_status(arch, datetime.now(tz).date())
+        if status == "antiguo":                     # el de la 2.7 no tiene máxima ni mínima
+            arch = {}
+        if self.archive_error and status != "ok":
+            missing = (f"No se pudo descargar el historial: {self.archive_error}.\n"
+                       "Lo reintento en la próxima actualización (o pulsa «Actualizar ahora»).")
+        elif self.archive_loading:
+            missing = ("Descargando el historial diario desde 1950 (máxima, mínima y lluvia).\n"
+                       "Solo la primera vez: tarda unos minutos.")
+        elif status == "antiguo":
+            missing = ("El historial guardado es de la versión anterior (solo la media del día):\n"
+                       "se descarga el nuevo en la próxima actualización (o pulsa «Actualizar ahora»).")
+        else:
+            missing = ("El historial desde 1950 aún no se ha descargado: se hace en la próxima\n"
+                       "actualización (o pulsa «Actualizar ahora»).")
         if arch and self.normals is None:
             self.normals, self.normals_label = normals_table(arch)
         normals = self.normals or {}
@@ -4545,8 +4586,7 @@ class App:
         elif d > today:
             lines.append("Es futuro.")
         elif not arch:
-            lines.append("El historial desde 1950 aún no se ha descargado (se hace al reentrenar; "
-                         "la primera vez tarda unos minutos).")
+            lines.append(missing)
         elif d > today - timedelta(days=7):
             lines.append("ERA5 publica con unos 5 días de retraso.")
         else:
@@ -4595,7 +4635,7 @@ class App:
                         f"{n['rain']:.1f} mm de media")
             sec["normal"].config(text=txt)
         else:
-            sec["normal"].config(text="Hace falta el historial desde 1950.")
+            sec["normal"].config(text="Hace falta el historial desde 1950." if arch else missing)
         rec = day_records(arch, d.month, d.day) if arch else None
         if rec:
             def r_(x, unit="°C"):
@@ -4606,12 +4646,11 @@ class App:
                 f"Día más lluvioso {r_(rec['rain'], 'mm')}\n"
                 f"El {d.day} de {mes} de {rec['n']} años ({rec['first']}–{rec['last']})"))
         else:
-            sec["records"].config(text="Hace falta el historial desde 1950.")
+            sec["records"].config(text="Sin datos de esta fecha." if arch else missing)
 
         # --- gráficas
         if not arch:
-            msg = "El historial desde 1950 se descarga al reentrenar\n(la primera vez tarda unos minutos)."
-            self.alm_month_chart.message(msg)
+            self.alm_month_chart.message(missing)
             self.alm_years_chart.message("")
             return
         mv = month_view(arch, normals, d.year, d.month)

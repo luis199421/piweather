@@ -694,6 +694,57 @@ class TestAlmanaque(TempData):
         self.assertEqual(len(rows), len(self.days) + 1)
         self.assertTrue(any(r.startswith("2017-07-13,45.0,") for r in rows))
 
+    def test_estado_del_historial(self):
+        hoy = date(2026, 10, 22)
+        self.assertEqual(cp.archive_status({}, hoy), "vacío")
+        old = cp.daily_archive({"daily": {"time": self.resp["daily"]["time"],
+                                          "temperature_2m_mean": self.resp["daily"]["temperature_2m_mean"]}}, MADRID)
+        self.assertEqual(cp.archive_status(old, hoy), "antiguo")
+        self.assertEqual(cp.archive_status(self.arch, hoy), "atrasado")       # acaba en 2025
+        self.assertEqual(cp.archive_status(self.arch, date(2026, 1, 25)), "ok")
+
+    def _run_job(self, online, need_archive):
+        """Una actualización normal (sin reentrenar), como la de cada hora."""
+        import queue
+        W = Mundo(start=date.today() - timedelta(days=20), days=40, seed=2)
+        app = cp.App.__new__(cp.App)
+        app.q = queue.Queue()
+        calls = []
+
+        def era5(loc):
+            calls.append(loc)
+            return self.resp
+        with mock.patch.object(cp, "online", lambda timeout=8: online), \
+                mock.patch.object(cp, "live_forecast", side_effect=RuntimeError("sin datos")), \
+                mock.patch.object(cp, "extras_forecast", lambda loc: W.extras(time.time())), \
+                mock.patch.object(cp, "era5_daily", era5):
+            app._job(LOC, "k", False, None, need_archive)
+        drain()
+        msgs = []
+        while not app.q.empty():
+            msgs.append(app.q.get_nowait())
+        return msgs, calls
+
+    def test_con_historial_de_la_version_anterior_se_descarga_sin_esperar_a_reentrenar(self):
+        """Lo que pasó en Zinacantepec: modelo ya entrenado, historial de la 2.7 → almanaque vacío."""
+        msgs, calls = self._run_job(online=True, need_archive=True)
+        self.assertEqual(len(calls), 1)
+        hist = [d for k, d, _ in msgs if k == "history"]
+        self.assertTrue(hist)
+        self.assertEqual(cp.archive_status(hist[0][1], date(2026, 1, 25)), "ok")
+        self.assertTrue(hist[0][2])                         # descargado (no el del disco)
+        self.assertIn("forecast", [k for k, *_ in msgs])
+
+    def test_historial_bueno_no_se_vuelve_a_pedir(self):
+        msgs, calls = self._run_job(online=True, need_archive=False)
+        self.assertEqual(calls, [])
+        self.assertNotIn("history", [k for k, *_ in msgs])
+
+    def test_sin_internet_lo_dice_y_lo_reintenta_luego(self):
+        msgs, calls = self._run_job(online=False, need_archive=True)
+        self.assertEqual(calls, [])
+        self.assertIn(("history_err", "sin conexión a internet"), [(k, d) for k, d, _ in msgs])
+
     def test_descarga_con_tu_hora_y_todas_las_variables(self):
         calls = []
 
