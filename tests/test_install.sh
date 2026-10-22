@@ -50,9 +50,10 @@ s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1])
 s.sendall(b'version\n'); print(s.recv(64).decode().strip())" "$SOCK" 2>/dev/null
 }
 inst() { sh "$REPO/install.sh" --no-start "$@" 2>&1; }
-footprint() {   # todo lo que el instalador toca, con fechas de modificación
-    find "$HOME/.local" "$HOME/.config" "$HOME/.clima_pi/version_anterior" "$HOME/.clima_pi/clima-pi.png" \
-        -type f -exec sh -c 'for f; do printf "%s %s %s\n" "$f" "$(stat -c %Y "$f")" "$(cksum < "$f")"; done' sh {} + 2>/dev/null | sort
+footprint() {   # lo que gestiona el instalador, con fechas de modificación (no las cachés de GTK)
+    for f in "$D" "$MENU" "$AUTO" "$HOME/.clima_pi/clima-pi.png" "$HOME/.clima_pi/version_anterior"/*; do
+        [ -f "$f" ] && printf "%s %s %s\n" "$f" "$(stat -c %Y "$f")" "$(cksum < "$f")"
+    done
 }
 
 echo "== La versión 2.5, guardada en una carpeta con espacios, abierta y con arranque al encender"
@@ -96,6 +97,7 @@ for n in 2 3; do
     check "vez $n: «nada que cambiar»" 'echo "$out" | grep -q "no había nada que cambiar"'
     check "vez $n: no cierra la ventana abierta" '[ "$(version | awk "{print \$3}")" = "$pid" ]'
     check "vez $n: no toca ningún archivo" '[ "$before" = "$(footprint)" ]'
+    [ "$before" = "$(footprint)" ] || { echo "$before" > "$HOME/a"; footprint > "$HOME/b"; diff "$HOME/a" "$HOME/b"; }
 done
 
 echo "== 3. Cambiar el arranque, también idempotente"
