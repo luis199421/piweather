@@ -105,7 +105,7 @@ EOF
         kill $pids 2>/dev/null || true
         sleep 2
         pids=$(running_pids)
-        [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
+        if [ -n "$pids" ]; then kill -9 $pids 2>/dev/null || true; fi
     fi
     echo "Cerrado."
 }
