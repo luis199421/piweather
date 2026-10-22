@@ -772,9 +772,16 @@ def set_autostart(enabled):
                            "clima_pi.py) y ábrelo desde ahí")
     if have_pil() and not os.path.exists(p["icon"]):
         make_app_icon(p["icon"])
+    content = _desktop_entry(path, p["icon"], True)
+    try:
+        with open(p["autostart"]) as f:
+            if f.read() == content:                 # ya está igual: no tocar nada
+                return
+    except OSError:
+        pass
     os.makedirs(os.path.dirname(p["autostart"]), exist_ok=True)
     with open(p["autostart"], "w") as f:
-        f.write(_desktop_entry(path, p["icon"], True))
+        f.write(content)
 
 
 def autostart_enabled():
@@ -4250,6 +4257,13 @@ def main():
         except RuntimeError as e:
             sys.exit(f"No se pudo hacer la prueba: {e}")
         return
+    if "--menu-entry" in args:                   # lo usa install.sh (no hace falta la ventana)
+        ok = install_menu_entry()
+        if "--autostart" in args:
+            set_autostart(True)
+        elif "--no-autostart" in args:
+            set_autostart(False)
+        sys.exit(0 if ok else 1)
     if "--sensor-test" in args:                  # comprobar el DHT22
         sys.exit(sensor_test())
     if "--offline" in args:

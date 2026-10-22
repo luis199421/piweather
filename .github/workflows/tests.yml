@@ -17,5 +17,14 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install numpy tzdata pyflakes
-      - run: python -m pyflakes clima_pi.py tests
+      - run: python -m pyflakes clima_pi.py tests/*.py
       - run: python -m unittest discover -s tests -v
+
+  instalador:
+    # el instalador de verdad, con la versión 2.5 abierta, en una pantalla virtual
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y python3-tk python3-numpy xvfb shellcheck
+      - run: shellcheck -s sh install.sh tests/test_install.sh
+      - run: xvfb-run -a sh tests/test_install.sh

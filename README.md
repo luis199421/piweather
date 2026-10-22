@@ -12,12 +12,46 @@ cualquier PC con Python 3.9+) que hace tu propio pronóstico del tiempo:
   **sin internet**, sigue pronosticando. Si no lo conectas, todo funciona igual que siempre.
 * Pestañas: Ahora · Pronóstico · Por horas · Sol y Luna · Precisión · Clima histórico · En vivo.
 
+## Instalar (o actualizar desde la 2.5)
+
 ```bash
-sudo apt install python3-tk python3-numpy
-python3 clima_pi.py                  # la ventana
-python3 clima_pi.py --offline        # sin usar internet aunque lo haya
-python3 clima_pi.py --backtest       # prueba de precisión con lo descargado (sin ventana)
-python3 clima_pi.py --sensor-test    # comprobar el DHT22
+git clone -b claude/optimize-test-code-3ahdkb https://github.com/luis199421/piweather.git
+cd piweather
+sh install.sh
+```
+
+Sin terminal: descarga el ZIP, descomprímelo y haz doble clic en **Instalar Clima Pi**.
+Ejecútalo como tu usuario (sin `sudo`): solo pide la contraseña si falta algún paquete.
+
+El instalador:
+
+1. Instala lo que falte (`python3-tk`, `python3-numpy` y, si se puede, lo del icono de la barra).
+2. **Quita la versión anterior**: cierra la ventana y el icono de la barra (por las buenas; si
+   está colgada, a la fuerza), y aparta el `clima_pi.py` antiguo, esté donde esté guardado,
+   a `~/.clima_pi/version_anterior/clima_pi_2.5.py` (no lo borra, por si acaso). No toca un
+   editor como Thonny que tenga el archivo abierto.
+3. Instala la nueva en `~/.local/share/clima-pi/clima_pi.py`, la pone en el menú y respeta si
+   tenías «Iniciar con el Pi». **Tus datos se conservan** (historial, modelo, sensor).
+4. La abre.
+
+**Es idempotente:** ejecutarlo otra vez con lo mismo no cambia nada (ni cierra la ventana ni
+toca un archivo; dice «no había nada que cambiar»). Con una versión nueva, solo cambia lo
+necesario.
+
+```bash
+sh install.sh --autostart       # que arranque al encender (--no-autostart para quitarlo)
+sh install.sh --no-start        # no abrirla al terminar
+sh install.sh --uninstall       # quitarlo (tus datos de ~/.clima_pi se quedan)
+sh install.sh --purge           # quitarlo y borrar también tus datos
+```
+
+## Usar
+
+```bash
+python3 ~/.local/share/clima-pi/clima_pi.py                  # la ventana (o desde el menú)
+python3 ~/.local/share/clima-pi/clima_pi.py --offline        # sin usar internet aunque lo haya
+python3 ~/.local/share/clima-pi/clima_pi.py --backtest       # prueba de precisión, sin ventana
+python3 ~/.local/share/clima-pi/clima_pi.py --sensor-test    # comprobar el DHT22
 ```
 
 Datos en `~/.clima_pi/`. Datos meteorológicos: Open-Meteo.com (CC BY 4.0).
@@ -177,7 +211,15 @@ todos), huecos, un modelo que empieza tarde y otro que cambia de versión a mita
   (si no, la siguiente vez lo tomaría como lo último descargado).
 * **Varias copias:** la ventana responde ella misma; si está colgada, quien pregunta lo sabe.
 
-GitHub Actions las pasa con Python 3.9, 3.11 y 3.12 (`.github/workflows/tests.yml`).
+**El instalador** tiene su propia prueba, con la versión 2.5 abierta de verdad (en una
+carpeta personal temporal, no toca la tuya): `xvfb-run -a sh tests/test_install.sh`.
+Comprueba que cierra la 2.5 (también si está colgada), la aparta aunque esté en una carpeta
+con espacios, no toca un editor con el archivo abierto, conserva el arranque y tus datos;
+que una 2.ª y 3.ª vez no cambian nada (ni la ventana abierta ni un solo archivo); y que
+desinstalar o borrar dos veces seguidas no falla.
+
+GitHub Actions las pasa con Python 3.9, 3.11 y 3.12, y la del instalador en Ubuntu con una
+pantalla virtual (`.github/workflows/tests.yml`).
 Además probé la ventana de verdad (Tk en una pantalla virtual) con datos simulados, un DHT22
 simulado y un corte de internet a mitad.
 

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Instalar Clima Pi
+Comment=Instala Clima Pi (y quita la versión anterior). Tus datos se conservan.
+Exec=sh -c 'cd "$(dirname "$1")" && sh ./install.sh; echo; printf "Pulsa Enter para cerrar esta ventana "; read x' sh %k
+Icon=system-software-install
+Terminal=true
