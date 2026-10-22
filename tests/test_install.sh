@@ -12,6 +12,8 @@ PY=${PYTHON:-python3}
 "$PY" -c "import tkinter, numpy" 2>/dev/null || { echo "Falta tkinter o numpy: me la salto"; exit 0; }
 [ -n "${DISPLAY:-}" ] || { echo "Sin pantalla: ejecútala con xvfb-run -a sh $0"; exit 0; }
 export PYTHON="$PY"
+NEW=$(sed -n 's/^APP_VERSION = "\([^"]*\)".*/\1/p' "$REPO/clima_pi.py" | head -n 1)
+export NEW
 HOME=$(mktemp -d)
 export HOME XDG_RUNTIME_DIR="$HOME/run"
 mkdir -p "$XDG_RUNTIME_DIR"
@@ -70,23 +72,23 @@ EDITOR=$!
 wait_sock
 check "la 2.5 está abierta" '[ -n "$(running)" ]'
 
-echo "== 1. Instalar la 2.6"
+echo "== 1. Instalar la $NEW"
 out=$(inst)
 echo "$out" | sed 's/^/     /'
 check "la 2.5 se cerró" '[ -z "$(running)" ]'
 check "el editor con el archivo abierto sigue abierto" 'kill -0 $EDITOR'
 check "la 2.5 ya no está en su sitio" '[ ! -e "$OLD" ]'
 check "copia de la 2.5 apartada" '[ -f "$HOME/.clima_pi/version_anterior/clima_pi_2.5.py" ]'
-check "2.6 instalada" 'grep -q "^APP_VERSION = \"2.6\"" "$D"'
-check "el menú abre la 2.6" 'grep -q "\"$D\"\$" "$MENU"'
+check "$NEW instalada" 'grep -q "^APP_VERSION = \"$NEW\"" "$D"'
+check "el menú abre la nueva" 'grep -q "\"$D\"\$" "$MENU"'
 check "se conserva el arranque al encender" 'grep -q "\"$D\" --background" "$AUTO"'
 check "se conservan tus datos" '[ -f "$HOME/.clima_pi/config.json" ] && [ -f "$HOME/.clima_pi/40.417_-3.704/predicciones.db" ]'
 
-echo "== 2. Idempotente: otra vez, con la 2.6 abierta"
+echo "== 2. Idempotente: otra vez, con la $NEW abierta"
 (cd "$HOME" && "$PY" "$D" >/dev/null 2>&1 &)
 wait_sock
 pid=$(version | awk '{print $3}'); export pid
-check "la 2.6 responde" '[ -n "$pid" ]'
+check "la $NEW responde" '[ -n "$pid" ]'
 before=$(footprint); export before
 sleep 1
 for n in 2 3; do

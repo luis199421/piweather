@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Clima Pi 2 - predicción meteorológica local que combina 11 modelos
+Clima Pi 2 - predicción meteorológica local que combina 13 modelos
 ==================================================================
 Pensado para Raspberry Pi 5 (funciona en cualquier PC con Python 3.9+).
 
 Qué hace:
-  * Descarga gratis (Open-Meteo, sin clave) los pronósticos de 11 modelos
-    meteorológicos de todo el mundo para tu ciudad: ECMWF IFS, ECMWF AIFS (IA),
-    GFS, ICON, Météo-France, UK Met Office, GEM, JMA, KMA, CMA y BOM.
+  * Descarga gratis (Open-Meteo, sin clave) los pronósticos de 13 modelos
+    meteorológicos de todo el mundo para tu ciudad: ECMWF IFS, GFS, ICON, Météo-France,
+    UK Met Office, GEM, JMA, KMA, CMA y BOM, y tres de inteligencia artificial:
+    ECMWF AIFS, NOAA AIGFS y NOAA HGEFS (híbrido física + IA).
   * Entrena el "Modelo Pi": aprende cuánto se equivoca cada modelo en tu zona
     (comparando ~2 años de sus pronósticos con lo que pasó, según ERA5) y los
     combina dándole más peso a los que mejor aciertan. Técnica tipo MOS.
@@ -81,6 +82,9 @@ MODELS = [
     ("kma", "KMA (Corea)", ["kma_seamless"], "#34d399"),
     ("cma", "CMA (China)", ["cma_grapes_global"], "#f87171"),
     ("bom", "BOM (Australia)", ["bom_access_global"], "#818cf8"),
+    # modelos de IA de NOAA: dan un dato cada 6 h (los huecos se rellenan, ver fill_sparse)
+    ("aigfs", "NOAA AIGFS (IA)", ["ncep_aigfs025"], "#fb923c"),
+    ("hgefs", "NOAA HGEFS (física + IA)", ["ncep_hgefs025_ensemble_mean"], "#e879f9"),
 ]
 APP = ("app", "App típica (Open-Meteo)", ["best_match"], "#e2e8f0")
 NAMES = {k: n for k, n, _, _ in MODELS + [APP]}
@@ -161,6 +165,7 @@ LOG_Q = queue.Queue()            # lo que el programa va haciendo, para la pesta
 STATS = {"bytes": 0, "calls": 0, "weights": deque(), "lock": threading.Lock()}
 SHORT = {"ecmwf": "ECMWF", "aifs": "AIFS (IA)", "gfs": "GFS", "icon": "ICON", "mf": "M-France",
          "ukmo": "UKMO", "gem": "GEM", "jma": "JMA", "kma": "KMA", "cma": "CMA", "bom": "BOM",
+         "aigfs": "AIGFS (IA)", "hgefs": "HGEFS (IA)",
          "app": "App"}
 
 
@@ -439,7 +444,7 @@ def prev_runs(loc, key, ids):
         except RuntimeError as e:
             last_err = e
             continue
-        if len(series(data, "hourly", "temperature_2m_previous_day1")) > 24 * 45:
+        if data_days(series(data, "hourly", "temperature_2m_previous_day1")) > 45:
             return data
         last_err = RuntimeError("sin datos para esta zona")
     raise last_err or RuntimeError("sin datos")
@@ -480,7 +485,7 @@ def extras_forecast(loc):
 
 # ---------------------------------------------------------------- segundo plano, arranque e icono
 APP_ID = "clima-pi"
-APP_VERSION = "2.6"                         # si arranca una versión distinta, sustituye a la que corre
+APP_VERSION = "2.7"                         # si arranca una versión distinta, sustituye a la que corre
 WM_CLASS = "Clima-pi"                       # Tk pone en mayúscula la 1ª letra de className
 TRAY_PKGS = "gir1.2-ayatanaappindicator3-0.1 python3-gi python3-pil"
 
@@ -729,7 +734,7 @@ def _desktop_entry(path, icon, background):
     exe = sys.executable or "python3"
     extra = " --background" if background else ""
     lines = ["[Desktop Entry]", "Type=Application", "Name=Clima Pi",
-             "Comment=Pronóstico del tiempo que combina 11 modelos meteorológicos",
+             f"Comment=Pronóstico del tiempo que combina {len(MODELS)} modelos meteorológicos",
              f'Exec="{exe}" "{path}"{extra}', f"Icon={icon}", "Terminal=false",
              "Categories=Utility;Science;", f"StartupWMClass={WM_CLASS}", "StartupNotify=false"]
     if background:
@@ -1202,6 +1207,49 @@ def row_mean(M):
         return np.where(cnt > 0, s / np.maximum(cnt, 1), np.nan)
 
 
+def data_days(d):
+    """Días con algún dato (un modelo de 6 en 6 h tiene 4 datos al día, no 24)."""
+    return len({int(t) // 86400 for t in d})
+
+
+MAX_GAP_S = 6 * 3600          # huecos de hasta 6 h se rellenan en el tiempo
+
+
+def fill_sparse(M, ts, max_gap=MAX_GAP_S):
+    """Rellena los huecos cortos de cada modelo (p. ej. los que solo dan un dato cada 6 h).
+
+    No interpola la temperatura en línea recta (se perdería la máxima de la tarde), sino cuánto
+    se separa ese modelo de la media de los demás: el ciclo día/noche lo ponen los otros y la
+    opinión propia del modelo se conserva. Solo entre dos datos a ≤ max_gap; los extremos y los
+    huecos largos se dejan para impute()."""
+    M = np.array(M, dtype=float)
+    ts = np.asarray(ts, dtype=np.int64)
+    fin = np.isfinite(M)
+    if M.ndim != 2 or M.shape[1] < 2 or fin.all() or len(ts) < 3:
+        return M
+    orig = M.copy()
+    for j in range(M.shape[1]):
+        miss = ~fin[:, j]
+        if not miss.any():
+            continue
+        ref = row_mean(np.delete(orig, j, axis=1))
+        d = orig[:, j] - ref
+        ok = np.isfinite(d)
+        if ok.sum() < 2:
+            continue
+        tk, dk = ts[ok], d[ok]
+        cand = np.flatnonzero(miss & np.isfinite(ref))
+        pos = np.searchsorted(tk, ts[cand])
+        inside = (pos > 0) & (pos < len(tk))
+        cand, pos = cand[inside], pos[inside]
+        lo_t, hi_t = tk[pos - 1], tk[pos]
+        near = (hi_t - lo_t) <= max_gap
+        cand, pos, lo_t, hi_t = cand[near], pos[near], lo_t[near], hi_t[near]
+        w = (ts[cand] - lo_t) / np.maximum(hi_t - lo_t, 1)
+        M[cand, j] = ref[cand] + (1 - w) * dk[pos - 1] + w * dk[pos]
+    return M
+
+
 def impute(M):
     """Rellena huecos (modelo sin dato a esa hora) con la media de los demás modelos."""
     M = M.copy()
@@ -1357,13 +1405,14 @@ def train(era5_resp, prev, app_resp, tz):
     for L in LEADS:
         var = lead_var(L)
         fc = {k: series(prev[k], "hourly", var) for k in prev}
-        use = [k for k, *_ in MODELS if len(fc.get(k, {})) > 24 * 45]
+        use = [k for k, *_ in MODELS if data_days(fc.get(k, {})) > 45]
         if not use:
             continue
         M = np.full((len(truth_ts), len(use)), np.nan)
         for j, k in enumerate(use):
             d = fc[k]
             M[:, j] = [d.get(int(t), np.nan) for t in truth_ts]
+        M = fill_sparse(M, truth_ts)
         need = max(1, (len(use) + 1) // 2)
         ok = np.isfinite(M).sum(axis=1) >= need
         if ok.sum() < 24 * 60:
@@ -1550,6 +1599,15 @@ def make_forecast(live, extras, trained, tz, now, loc, correct=None, sensor_obs=
         raise RuntimeError("los pronósticos llegaron vacíos")
 
     all_ts = sorted(set().union(*[temps[k].keys() for k in order], xs.get("temperature_2m", {}).keys()))
+    if len(order) > 1:                       # modelos de 6 en 6 h: rellenar sus horas sueltas
+        grid = np.array(sorted(set().union(*[temps[k].keys() for k in order])), dtype=np.int64)
+        M = np.array([[temps[k].get(int(t), np.nan) for k in order] for t in grid])
+        F = fill_sparse(M, grid)
+        for j, k in enumerate(order):
+            new = np.flatnonzero(np.isfinite(F[:, j]) & ~np.isfinite(M[:, j]))
+            if new.size:
+                temps[k] = dict(temps[k])
+                temps[k].update({int(grid[i]): float(F[i, j]) for i in new})
     fut = np.array([t for t in all_ts if now < t <= now + 7 * 86400], dtype=np.int64)
 
     # --- Modelo Pi
@@ -3444,7 +3502,7 @@ class App:
             w.destroy()
         first = not os.path.exists(os.path.join(loc_dir(loc), "era5_horario.json"))
         self.fc_chart.message("Preparando datos…" + ("\nLa primera vez descarga ~2 años de pronósticos "
-                                                    "de 11 modelos: tarda unos minutos." if first else ""))
+                                                    f"de {len(MODELS)} modelos: tarda unos minutos." if first else ""))
         self.acc_chart.message("Esperando al entrenamiento…")
         self.hist_chart.message("El historial desde 1950 se descarga al final.")
         self.month_chart.message("")

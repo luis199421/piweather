@@ -12,6 +12,7 @@ from datetime import date, datetime, timezone
 import numpy as np
 
 KEYS = ["ecmwf", "aifs", "gfs", "icon", "mf", "ukmo", "gem", "jma", "kma", "cma", "bom"]
+AI_KEYS = ["aigfs", "hgefs"]          # modelos de IA de NOAA (opcionales: Mundo(..., ai=True))
 LEADS = range(0, 8)
 
 
@@ -31,7 +32,7 @@ def _ar(rng, n, phi, sd):
 
 
 class Mundo:
-    def __init__(self, start=date(2023, 6, 1), days=760, seed=1, tz_hours=1):
+    def __init__(self, start=date(2023, 6, 1), days=760, seed=1, tz_hours=1, ai=False, ai_fix=0.0):
         rng = np.random.default_rng(seed)
         t0 = int(datetime(start.year, start.month, start.day, tzinfo=timezone.utc).timestamp())
         self.ts = t0 + 3600 * np.arange(days * 24, dtype=np.int64)
@@ -54,8 +55,10 @@ class Mundo:
         skill = dict(zip(KEYS, [0.55, 0.6, 0.85, 0.7, 0.75, 0.7, 0.9, 0.85, 0.9, 1.0, 1.0]))
         bias = dict(zip(KEYS, [0.3, -0.4, 1.0, -0.6, 0.2, -0.2, 0.8, -1.0, 0.5, 1.4, -0.8]))
         dbias = dict(zip(KEYS, [-0.5, -0.8, -1.2, 0.4, -0.3, 0.6, -1.0, 0.8, -0.6, 1.2, 0.3]))
+        shared_by_lead = {}
         for L in LEADS:
             shared = _ar(rng, n, 0.97, 0.35 + 0.35 * L)              # error común a todos
+            shared_by_lead[L] = shared
             for k in KEYS:
                 own = _ar(rng, n, 0.95, skill[k] * (0.35 + 0.3 * L))
                 b = bias[k] + np.zeros(n)
@@ -67,6 +70,26 @@ class Mundo:
                 if k == "bom":                                       # empieza tarde
                     f[: n // 3] = np.nan
                 self.fc[(k, L)] = f
+        self.keys = list(KEYS)
+        if ai:
+            self._add_ai(seed, n, season, diurnal, shared_by_lead, ai_fix)
+
+    def _add_ai(self, seed, n, season, diurnal, shared_by_lead, fix):
+        """Modelos de IA como los de NOAA: un dato cada 6 h, historial corto (son recientes),
+        error propio que crece poco con los días, y ciclo día/noche algo aplanado.
+        fix: parte del error común a los demás modelos que la IA sí acierta (0 = ninguna)."""
+        rng = np.random.default_rng(seed + 1000)          # no cambia los datos de los demás
+        six = (self.ts // 3600) % 6 != 0
+        for k, sd0, sd1, b, damp, start in (("aigfs", 0.30, 0.13, 0.4, -0.6, 0.55),
+                                            ("hgefs", 0.25, 0.10, -0.3, -0.9, 0.65)):
+            for L in LEADS:
+                own = _ar(rng, n, 0.95, sd0 + sd1 * L)
+                f = (self.truth + b + damp * (1 + 0.3 * season) * diurnal
+                     + (1 - fix) * shared_by_lead[L] + own)
+                f[six] = np.nan                                   # solo 00, 06, 12 y 18 UTC
+                f[: int(n * start)] = np.nan
+                self.fc[(k, L)] = f
+            self.keys.append(k)
 
     # ---------------------------------------------------------- respuestas tipo Open-Meteo
     @staticmethod
@@ -85,7 +108,7 @@ class Mundo:
         return {"hourly": self._blk(self.ts[m], **{lead_var(L): self.fc[(key, L)][m] for L in LEADS})}
 
     def prev_all(self, upto):
-        return {k: self.prev(k, upto) for k in KEYS}
+        return {k: self.prev(k, upto) for k in self.keys}
 
     def app(self, upto):
         """La «app típica» (best match): la media de tres modelos."""
@@ -94,7 +117,7 @@ class Mundo:
                 for L in LEADS}
         return {"hourly": self._blk(self.ts[m], **cols)}
 
-    def live(self, now, keys=KEYS):
+    def live(self, now, keys=None):
         """Pronóstico «actual» emitido en `now`: a x días vista, mezcla de las antelaciones."""
         out = {}
         sel = (self.ts > now - 86400) & (self.ts <= now + 8 * 86400)
@@ -103,7 +126,7 @@ class Mundo:
         lo = np.floor(x).astype(int)
         hi = np.minimum(lo + 1, 7)
         w = x - lo
-        for k in keys:
+        for k in (self.keys if keys is None else keys):
             F = np.vstack([self.fc[(k, L)][sel] for L in LEADS])
             v = (1 - w) * F[lo, np.arange(len(ts))] + w * F[hi, np.arange(len(ts))]
             out[k] = {"hourly": self._blk(ts, temperature_2m=v)}

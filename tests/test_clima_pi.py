@@ -27,7 +27,7 @@ sys.path.insert(0, HERE)
 spec = importlib.util.spec_from_file_location("clima_pi", os.path.join(os.path.dirname(HERE), "clima_pi.py"))
 cp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cp)
-from sintetico import KEYS, Mundo  # noqa: E402
+from sintetico import AI_KEYS, KEYS, Mundo  # noqa: E402
 
 try:
     from zoneinfo import ZoneInfo
@@ -214,6 +214,81 @@ class TestPrecision(TempData):
         tr = cp.backtest(out=out.append)
         self.assertEqual(sorted(tr["leads"]), list(range(8)))
         self.assertTrue(any("Prueba de precisión" in x for x in out))
+
+
+class TestRelleno(unittest.TestCase):
+    """Modelos que solo dan un dato cada 6 h (los de IA de NOAA)."""
+
+    def test_rellena_con_el_ciclo_de_los_demas(self):
+        ts = 3600 * np.arange(48, dtype=np.int64)
+        others = 10 + 5 * np.sin(2 * np.pi * np.arange(48) / 24)
+        ia = others + 1.0                                     # va siempre 1 °C por encima
+        ia[np.arange(48) % 6 != 0] = np.nan
+        M = np.column_stack([others, others + 0.2, ia])
+        F = cp.fill_sparse(M, ts)
+        np.testing.assert_allclose(F[:43, 2], (others + 0.1)[:43] + 0.9, atol=1e-9)
+        self.assertTrue(np.isnan(F[43:, 2]).all())            # después del último dato: no inventa
+        np.testing.assert_array_equal(F[:, :2], M[:, :2])     # a los demás no los toca
+
+    def test_huecos_largos_y_datos_completos(self):
+        ts = 3600 * np.arange(30, dtype=np.int64)
+        M = np.column_stack([np.arange(30.0), np.arange(30.0) + 1])
+        M[5:20, 1] = np.nan                                   # 15 h sin datos: no se rellena
+        self.assertTrue(np.isnan(cp.fill_sparse(M, ts)[5:20, 1]).all())
+        full = np.column_stack([np.arange(30.0), np.arange(30.0)])
+        np.testing.assert_array_equal(cp.fill_sparse(full, ts), full)
+
+    def test_dias_con_datos(self):
+        self.assertEqual(cp.data_days({0: 1, 6 * 3600: 1, 86400: 2}), 2)
+
+    def test_estan_en_la_lista(self):
+        ids = {k: ids for k, _, ids, _ in cp.MODELS}
+        self.assertEqual(ids["aigfs"], ["ncep_aigfs025"])
+        self.assertEqual(ids["hgefs"], ["ncep_hgefs025_ensemble_mean"])
+        self.assertEqual(len(cp.MODELS), 13)
+
+
+@unittest.skipIf(MADRID is None, "sin zonas horarias")
+class TestModelosIA(TempData):
+    """Si los modelos de IA aciertan algo que los demás fallan a la vez, el Pi lo aprovecha."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.W = Mundo(days=760, seed=3, ai=True, ai_fix=0.35)
+        cls.upto = int(cls.W.ts[0] + 700 * D)
+        prev = cls.W.prev_all(cls.upto)
+        args = (cls.W.era5(cls.upto),)
+        cls.con = cp.train(*args, prev, cls.W.app(cls.upto), MADRID)
+        cls.sin = cp.train(*args, {k: v for k, v in prev.items() if k in KEYS}, cls.W.app(cls.upto), MADRID)
+        with mock.patch.object(cp, "fill_sparse", lambda M, ts, **k: np.array(M, float)):
+            cls.relleno_viejo = cp.train(*args, prev, cls.W.app(cls.upto), MADRID)
+        drain()
+
+    def test_se_usan_aunque_tengan_poco_historial(self):
+        for L in (1, 4, 7):
+            for k in AI_KEYS:
+                self.assertIn(k, self.con["leads"][L]["use"])
+
+    def test_mejoran_el_pronostico(self):
+        for L in (3, 5, 7):
+            self.assertLess(self.con["leads"][L]["mae"]["pi"], self.sin["leads"][L]["mae"]["pi"] * 0.97, L)
+
+    def test_el_relleno_de_6_horas_importa(self):
+        e = lambda tr: np.mean([tr["leads"][L]["mae"]["pi"] for L in range(1, 8)])   # noqa: E731
+        self.assertLess(e(self.con), e(self.relleno_viejo) * 0.97)
+
+    def test_desglose_exacto_con_modelos_de_6_horas(self):
+        now = self.upto + 3 * D + 1800
+        r = cp.make_forecast(self.W.live(now), self.W.extras(now), self.con, MADRID, now, LOC)
+        self.assertIn("aigfs", r["models"])
+        n = 0
+        for t, v in sorted(r["pi"].items())[:120]:
+            e = cp.explain_hour(r, self.con, MADRID, t)
+            if e:
+                self.assertAlmostEqual(e["total"], v, places=6)
+                n += 1
+        self.assertGreater(n, 100)
+        drain()
 
 
 class TestRidge(unittest.TestCase):

@@ -3,8 +3,9 @@
 `clima_pi.py` es un solo programa de Python para la **Raspberry Pi** (funciona en
 cualquier PC con Python 3.9+) que hace tu propio pronóstico del tiempo:
 
-* Descarga gratis (Open-Meteo, sin clave) los pronósticos de **11 modelos** meteorológicos
-  (ECMWF IFS y AIFS, GFS, ICON, Météo-France, UK Met Office, GEM, JMA, KMA, CMA y BOM).
+* Descarga gratis (Open-Meteo, sin clave) los pronósticos de **13 modelos** meteorológicos:
+  ECMWF IFS, GFS, ICON, Météo-France, UK Met Office, GEM, JMA, KMA, CMA y BOM, y **tres de
+  inteligencia artificial**: ECMWF AIFS, NOAA AIGFS y NOAA HGEFS (híbrido física + IA).
 * Entrena el **Modelo Pi**: aprende cuánto se equivoca cada modelo en tu zona (comparando
   ~2 años de sus pronósticos con lo que pasó, según ERA5) y los combina dándole más peso a
   los que mejor aciertan (técnica tipo MOS).
@@ -57,6 +58,40 @@ python3 ~/.local/share/clima-pi/clima_pi.py --sensor-test    # comprobar el DHT2
 Datos en `~/.clima_pi/`. Datos meteorológicos: Open-Meteo.com (CC BY 4.0).
 
 ---
+
+## Qué cambió en la versión 2.7: modelos de inteligencia artificial
+
+Los modelos de IA (GraphCast, AIFS, Pangu…) calculan el planeta entero y necesitan tarjetas
+gráficas grandes: no caben en una Raspberry. Lo que sí se puede es **usar lo que ya calculan**
+y que el Modelo Pi aprenda cuánto confiar en ellos en tu zona. Además del ECMWF AIFS que ya
+estaba, se añaden los dos de NOAA que ofrece Open-Meteo:
+
+| Modelo | Identificador | Qué es |
+|---|---|---|
+| NOAA AIGFS | `ncep_aigfs025` | la versión con IA del GFS |
+| NOAA HGEFS | `ncep_hgefs025_ensemble_mean` | media de un conjunto híbrido física + IA |
+
+Dan **un dato cada 6 horas**. Rellenar las horas de en medio con la media de los demás modelos
+(lo que se hacía con cualquier hueco) le quita al Modelo Pi casi todo lo que aportan. Ahora se
+interpola en el tiempo **cuánto se separa ese modelo de la media de los demás**: el ciclo
+día/noche lo ponen los otros y la opinión propia del modelo de IA se conserva.
+
+Lo que dicen las pruebas (4 mundos simulados, error medio en vivo):
+
+| | error medio | a 5 días |
+|---|---|---|
+| sin los modelos de NOAA | 1,159 °C | 1,69 °C |
+| con ellos, si aciertan **parte de lo que los demás fallan a la vez** | **1,043 °C (−10 %)** | **1,49 °C** |
+| lo mismo pero rellenando como antes | 1,143 °C | 1,66 °C |
+| con ellos, si solo son «uno más» (fallan lo mismo que los demás) | 1,158 °C | 1,68 °C |
+
+O sea: el Modelo Pi los aprovecha (en ese caso les da el mayor peso, ~0,5 cada uno) **si de
+verdad aportan algo**, y si no, no empeora. Cuánto aportan en tu zona solo lo dicen tus datos
+reales: mira la pestaña Precisión o `--backtest` después del primer entrenamiento.
+
+Avisos: si Open-Meteo no tiene el archivo de pronósticos pasados de alguno, el programa lo dice
+(«sin datos de: …») y sigue sin él; y como son recientes, al principio tienen menos historial
+que los demás (se usan desde que tienen 45 días con datos).
 
 ## Qué cambió en la versión 2.6
 
@@ -184,16 +219,20 @@ pestaña Precisión y con `--backtest` (y la del sensor, en el registro «En viv
 python3 -m unittest discover -s tests -v
 ```
 
-61 pruebas, sin red, sin ventana y sin sensor de verdad (un DHT22 simulado con los archivos
+69 pruebas, sin red, sin ventana y sin sensor de verdad (un DHT22 simulado con los archivos
 que crea Linux), en ~30 s. Usan un mundo meteorológico sintético con el formato exacto de
 las respuestas de Open-Meteo (`tests/sintetico.py`): 11 modelos con su sesgo, su sesgo
 día/noche que cambia con la estación, error que crece con la antelación (en parte común a
-todos), huecos, un modelo que empieza tarde y otro que cambia de versión a mitad.
+todos), huecos, un modelo que empieza tarde y otro que cambia de versión a mitad; y, si se
+pide, los 2 de IA de NOAA (un dato cada 6 h, historial corto, ciclo día/noche aplanado).
 
 * **Precisión:** el Modelo Pi mejora a la media y al mejor modelo a 1–7 días, también en
   máxima/mínima; la prueba no mira el futuro; mezcla de antelaciones; el desglose suma
   exactamente la predicción (también con huecos); guardar y cargar da lo mismo; un modelo
   de versión anterior o un archivo roto se ignoran.
+* **Modelos de IA de 6 en 6 h:** el relleno conserva el ciclo de los demás y no inventa
+  fuera de sus datos; se usan aunque tengan poco historial; si aportan, mejoran el pronóstico
+  (y el relleno nuevo es necesario para ello); el desglose sigue sumando exacto.
 * **Hora local:** todas las horas de un año con sus cambios de hora, comparadas con `zoneinfo`.
 * **Sol y Luna:** salida y puesta del sol en Madrid, Londres y Sídney (±3 min de lo publicado),
   sol de medianoche y noche polar en Tromsø, fases de la Luna de 2024 (±20 min).
