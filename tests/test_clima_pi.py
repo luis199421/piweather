@@ -584,6 +584,136 @@ class TestClimaHistorico(unittest.TestCase):
         self.assertTrue(cp.nice_ticks(float("nan"), 1))
 
 
+# =========================================================================== almanaque
+@unittest.skipIf(MADRID is None, "sin zonas horarias")
+class TestAlmanaque(TempData):
+    """Historial diario desde 1950 (como lo da ERA5 con días de tu hora) con récords puestos a mano."""
+
+    @classmethod
+    def setUpClass(cls):
+        rng = np.random.default_rng(0)
+        days = []
+        d = date(1950, 1, 1)
+        while d <= date(2025, 12, 31):
+            days.append(d)
+            d += timedelta(days=1)
+        doy = np.array([x.timetuple().tm_yday for x in days])
+        yr = np.array([x.year for x in days])
+        tmax = 20 + 10 * np.cos(2 * np.pi * (doy - 200) / 365.25) + 0.02 * (yr - 1950) + rng.normal(0, 2, len(days))
+        tmin = tmax - 10 + rng.normal(0, 1, len(days))
+        rain = np.where(rng.random(len(days)) < 0.2, rng.exponential(6, len(days)), 0.0)
+        idx = {x: i for i, x in enumerate(days)}
+        tmax[idx[date(2017, 7, 13)]] = 45.0
+        tmin[idx[date(1956, 2, 2)]] = -15.0
+        rain[idx[date(1989, 10, 22)]] = 120.0
+        cls.tmax, cls.days, cls.yr, cls.doy = tmax, days, yr, doy
+        cls.resp = {"daily": {"time": [int(cp.midnight(x, MADRID)) for x in days],
+                              "temperature_2m_max": tmax.round(2).tolist(),
+                              "temperature_2m_min": tmin.round(2).tolist(),
+                              "temperature_2m_mean": ((tmax + tmin) / 2).round(2).tolist(),
+                              "precipitation_sum": rain.round(2).tolist()}}
+        cls.arch = cp.daily_archive(cls.resp, MADRID)
+        cls.normals, cls.label = cp.normals_table(cls.arch)
+
+    def test_fechas_de_tu_hora(self):
+        # la medianoche del 1 de enero de 1950 en Madrid es el 31 de diciembre a las 23 h en UTC
+        self.assertEqual(min(self.arch), date(1950, 1, 1))
+        self.assertEqual(len(self.arch), len(self.days))
+        self.assertEqual(self.arch[date(2017, 7, 13)]["tmax"], 45.0)
+        h = cp.climate_history(self.resp, MADRID)
+        self.assertEqual(h["annual"][0][0], 1950)
+        self.assertAlmostEqual(h["slope"], 0.02, delta=0.005)
+
+    def test_lo_normal(self):
+        self.assertEqual(self.label, "1991–2020")
+        sel = [(1991 <= y <= 2020) and abs(dy - date(2001, 7, 13).timetuple().tm_yday) <= 3
+               for y, dy in zip(self.yr, self.doy)]
+        self.assertAlmostEqual(self.normals[(7, 13)]["tmax"], float(np.mean(self.tmax[sel])), delta=0.3)
+        self.assertIn((2, 29), self.normals)
+        self.assertTrue(0 <= self.normals[(10, 22)]["rain_days"] <= 1)
+
+    def test_records(self):
+        self.assertEqual(cp.day_records(self.arch, 7, 13)["max_high"], (45.0, 2017))
+        self.assertEqual(cp.day_records(self.arch, 2, 2)["min_low"], (-15.0, 1956))
+        self.assertEqual(cp.day_records(self.arch, 10, 22)["rain"], (120.0, 1989))
+        r = cp.day_records(self.arch, 2, 29)
+        self.assertEqual(r["n"], 19)                       # años bisiestos de 1952 a 2024
+        self.assertEqual(cp.rank_of(self.arch, date(2017, 7, 13), "tmax"), (1, 76))
+
+    def test_mes_y_misma_fecha_cada_anio(self):
+        self.assertEqual(len(cp.month_view(self.arch, self.normals, 2024, 2)), 29)
+        mv = cp.month_view(self.arch, self.normals, 2023, 2)
+        self.assertEqual(len(mv), 28)
+        self.assertTrue(all(x[1] is not None and x[4] is not None for x in mv))
+        self.assertEqual(len(cp.same_day_series(self.arch, 7, 13)), 76)
+        self.assertTrue(all(y % 4 == 0 for y, *_ in cp.same_day_series(self.arch, 2, 29)))
+        future = cp.month_view(self.arch, self.normals, 2030, 1)
+        self.assertTrue(all(x[1] is None and x[4] is not None for x in future))
+
+    def test_historial_antiguo_solo_con_media(self):
+        old = {"daily": {"time": self.resp["daily"]["time"][:800],
+                         "temperature_2m_mean": self.resp["daily"]["temperature_2m_mean"][:800]}}
+        arch = cp.daily_archive(old, MADRID)
+        self.assertIsNone(cp.day_records(arch, 1, 1))
+        self.assertEqual(cp.normals_table(arch)[0], {})
+
+    def test_sol_y_luna_de_cualquier_fecha(self):
+        a = cp.astro_day(40.4168, -3.7038, MADRID, date(2024, 6, 21))
+        sr = datetime.fromtimestamp(a["sunrise"], MADRID)
+        self.assertEqual((sr.hour, sr.minute // 5), (6, 44 // 5))
+        self.assertIsNone(a["polar"])
+        self.assertIn("Luna llena", a["next"])
+        oslo = ZoneInfo("Europe/Oslo")
+        self.assertEqual(cp.astro_day(69.65, 18.96, oslo, date(2024, 6, 21))["polar"], "day")
+        self.assertEqual(cp.astro_day(69.65, 18.96, oslo, date(2024, 12, 21))["polar"], "night")
+        self.assertEqual(cp.astro_day(-33.87, 151.21, ZoneInfo("Australia/Sydney"), date(1950, 1, 1))["phase"]
+                         in ("Luna nueva", "Creciente", "Cuarto creciente", "Gibosa creciente", "Luna llena",
+                             "Gibosa menguante", "Cuarto menguante", "Menguante"), True)
+
+    def test_lo_que_guardo_clima_pi_ese_dia(self):
+        d = date(2026, 3, 4)
+        con = cp.db(LOC)
+        con.execute("INSERT INTO obs_day VALUES (?, 18.5, 6.0)", (d.isoformat(),))
+        con.commit()
+        con.close()
+        cp.save_tele(LOC, d.isoformat(), 19, 5, 18, 6)
+        t0 = int(cp.midnight(d, MADRID))
+        cp.store_sensor(LOC, [(t0 + 300 * i, 5 + 10 * math.sin(math.pi * i / 288), 60) for i in range(288)])
+        r = cp.local_day(LOC, MADRID, d)
+        self.assertEqual(r["obs"], (18.5, 6.0))
+        self.assertEqual(r["tele"], (19, 5, 18, 6))
+        self.assertAlmostEqual(r["sensor"][0], 15, delta=0.3)
+        self.assertEqual(cp.local_day(LOC, MADRID, date(2026, 3, 5)), {})
+
+    def test_exportar_csv(self):
+        path = os.path.join(self.dir, "h.csv")
+        self.assertEqual(cp.export_archive_csv(self.arch, path), len(self.days))
+        with open(path) as f:
+            rows = f.read().splitlines()
+        self.assertEqual(rows[0], "fecha,max_C,min_C,media_C,lluvia_mm")
+        self.assertEqual(len(rows), len(self.days) + 1)
+        self.assertTrue(any(r.startswith("2017-07-13,45.0,") for r in rows))
+
+    def test_descarga_con_tu_hora_y_todas_las_variables(self):
+        calls = []
+
+        def fake(base, params, timeout=90):
+            calls.append(params)
+            a = date.fromisoformat(params["start_date"])
+            n = (date.fromisoformat(params["end_date"]) - a).days + 1
+            ts = [int(cp.midnight(a + timedelta(days=i), MADRID)) for i in range(n)]
+            return {"daily": {"time": ts, **{v: [1.0] * n for v in params["daily"].split(",")}}}
+        path = os.path.join(cp.loc_dir(LOC), "era5_diario.json")
+        cp._save_json(path, {"daily": {"time": [0], "temperature_2m_mean": [1.0]}})   # de la 2.6
+        with mock.patch.object(cp, "get_json", fake):
+            data = cp.era5_daily(LOC)
+        self.assertEqual(calls[0]["timezone"], "Europe/Madrid")
+        self.assertEqual(calls[0]["daily"], cp.ARCHIVE_DAILY)
+        self.assertEqual(calls[0]["start_date"], cp.HISTORY_START.isoformat())   # se descargó de nuevo
+        self.assertIn("temperature_2m_max", data["daily"])
+        drain()
+
+
 # =========================================================================== sensor DHT22
 class FakeDHT:
     """Un DHT22 de mentira con los archivos que crea el controlador dht11 de Linux."""

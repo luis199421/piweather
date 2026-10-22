@@ -14,7 +14,8 @@ Qué hace:
     combina dándole más peso a los que mejor aciertan. Técnica tipo MOS.
   * Te deja apuntar lo que dicen las noticias para mañana y lleva el marcador
     "Pi contra la tele".
-  * Pestañas: Ahora · Pronóstico · Por horas · Sol y Luna · Precisión · Clima histórico.
+  * Pestañas: Ahora · Pronóstico · Por horas · Sol y Luna · Precisión · Clima histórico ·
+    Almanaque (cualquier fecha desde 1950: lo que pasó, lo normal, récords, sol y luna) · En vivo.
   * Se queda funcionando: actualiza cada hora y reentrena cada día.
   * Opcional, un sensor DHT22: corrige el pronóstico para tu sitio exacto y, sin internet,
     sigue pronosticando con lo que mide y con lo último que se descargó. Sin sensor no cambia nada.
@@ -390,10 +391,13 @@ def update_history(path, section, full_start, end, fetch, chunk_days, max_age, r
     return data
 
 
-def era5_fetch(loc, hourly=None, daily=None):
+def era5_fetch(loc, hourly=None, daily=None, local=False):
+    """local=True: los días van de medianoche a medianoche de tu hora (no de la UTC)."""
     def fetch(start, stop):
         p = dict(_ll(loc), start_date=start.isoformat(), end_date=stop.isoformat(),
                  timeformat="unixtime", models="era5")
+        if local:
+            p["timezone"] = loc.get("timezone") or "auto"
         if hourly:
             p["hourly"] = hourly
         if daily:
@@ -413,11 +417,15 @@ def era5_hourly(loc):
                           era5_fetch(loc, hourly="temperature_2m"), 1500, 20 * 3600)
 
 
+# el almanaque necesita máxima, mínima y lluvia de cada día (hasta 10 variables cuestan lo mismo)
+ARCHIVE_DAILY = "temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum"
+
+
 def era5_daily(loc):
     end = date.today() - timedelta(days=6)
     return update_history(os.path.join(loc_dir(loc), "era5_diario.json"), "daily",
-                          HISTORY_START, end, era5_fetch(loc, daily="temperature_2m_mean"),
-                          2400, 6 * 86400)
+                          HISTORY_START, end, era5_fetch(loc, daily=ARCHIVE_DAILY, local=True),
+                          2400, 6 * 86400, required=ARCHIVE_DAILY.split(","))
 
 
 def lead_var(L):
@@ -485,7 +493,7 @@ def extras_forecast(loc):
 
 # ---------------------------------------------------------------- segundo plano, arranque e icono
 APP_ID = "clima-pi"
-APP_VERSION = "2.7"                         # si arranca una versión distinta, sustituye a la que corre
+APP_VERSION = "2.8"                         # si arranca una versión distinta, sustituye a la que corre
 WM_CLASS = "Clima-pi"                       # Tk pone en mayúscula la 1ª letra de className
 TRAY_PKGS = "gir1.2-ayatanaappindicator3-0.1 python3-gi python3-pil"
 
@@ -2497,11 +2505,11 @@ def offline_forecast(loc, tz, now, trained=None, sm=None):
     return r
 
 
-def climate_history(resp):
+def climate_history(resp, tz=timezone.utc):
     d = series(resp, "daily", "temperature_2m_mean")
     years, by_month = {}, {}
     for t, v in d.items():
-        dt = datetime.fromtimestamp(t, timezone.utc)
+        dt = datetime.fromtimestamp(t, tz)
         years.setdefault(dt.year, []).append(v)
         by_month.setdefault((dt.year, dt.month), []).append(v)
     annual = [(y, sum(v) / len(v)) for y, v in sorted(years.items()) if len(v) >= 360]
@@ -2522,6 +2530,182 @@ def climate_history(resp):
             "normal": normal, "recent": recent, "recent_label": f"{last - 4}–{last}",
             "warmest": max(annual, key=lambda a: a[1]),
             "coldest": min(annual, key=lambda a: a[1])}
+
+
+# ================================================================ almanaque
+MESES_L = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+           "septiembre", "octubre", "noviembre", "diciembre"]
+NORMAL_YEARS = (1991, 2020)              # periodo de referencia de la OMM
+RAIN_DAY_MM = 1.0                        # «día de lluvia»: 1 mm o más
+
+
+def daily_archive(resp, tz=timezone.utc):
+    """{fecha: {"tmax", "tmin", "tmean", "rain"}} del historial diario de ERA5."""
+    out = {}
+    for var, key in (("temperature_2m_max", "tmax"), ("temperature_2m_min", "tmin"),
+                     ("temperature_2m_mean", "tmean"), ("precipitation_sum", "rain")):
+        for t, v in series(resp, "daily", var).items():
+            # +12 h: la medianoche de tu hora cae en el día correcto aunque haya cambio de hora
+            out.setdefault(datetime.fromtimestamp(t + 43200, tz).date(), {})[key] = v
+    return out
+
+
+def _same_date(y, m, d):
+    """La misma fecha en el año y (el 29 de febrero, en años normales, es el 28)."""
+    try:
+        return date(y, m, d)
+    except ValueError:
+        return date(y, m, 28)
+
+
+def normals_table(arch, years=NORMAL_YEARS, window=3):
+    """Lo normal para cada día del año: media de ±window días en el periodo de referencia.
+
+    Si el historial no cubre al menos 10 años de ese periodo, usa todos los años que haya."""
+    if not arch:
+        return {}, None
+    ys = sorted({d.year for d in arch})
+    use = [y for y in ys if years[0] <= y <= years[1]]
+    if len(use) < 10:
+        use = ys
+    label = f"{use[0]}–{use[-1]}"
+    acc = {}
+    for y in use:
+        for m in range(1, 13):
+            for dd in range(1, 32):
+                try:
+                    base = date(2000, m, dd)              # 2000: año bisiesto, todas las fechas
+                except ValueError:
+                    continue
+                vals = acc.setdefault((base.month, base.day), {"tmax": [], "tmin": [], "tmean": [], "rain": []})
+                c = _same_date(y, m, dd)
+                for k in range(-window, window + 1):
+                    v = arch.get(c + timedelta(days=k))
+                    if v:
+                        for key in vals:
+                            if v.get(key) is not None:
+                                vals[key].append(v[key])
+    out = {}
+    for md, vals in acc.items():
+        if not vals["tmax"]:
+            continue
+        rain = vals["rain"]
+        out[md] = {"tmax": float(np.mean(vals["tmax"])), "tmin": float(np.mean(vals["tmin"])),
+                   "tmean": float(np.mean(vals["tmean"])) if vals["tmean"] else None,
+                   "rain": float(np.mean(rain)) if rain else None,
+                   "rain_days": float(np.mean([r >= RAIN_DAY_MM for r in rain])) if rain else None}
+    return out, label
+
+
+def day_records(arch, month, day):
+    """Récords de esa fecha (mismo día y mes de todos los años): (valor, año) de cada uno."""
+    rows = []
+    for y in sorted({d.year for d in arch}):
+        try:
+            d = date(y, month, day)
+        except ValueError:
+            continue
+        v = arch.get(d)
+        if v and v.get("tmax") is not None and v.get("tmin") is not None:
+            rows.append((y, v))
+    if not rows:
+        return None
+
+    def best(key, pick):
+        vals = [(v[key], y) for y, v in rows if v.get(key) is not None]
+        return pick(vals) if vals else None
+    return {"n": len(rows), "first": rows[0][0], "last": rows[-1][0],
+            "max_high": best("tmax", max), "max_low": best("tmax", min),
+            "min_low": best("tmin", min), "min_high": best("tmin", max),
+            "rain": best("rain", max)}
+
+
+def rank_of(arch, d, key):
+    """Puesto de ese día entre la misma fecha de todos los años (1 = el más alto) y cuántos hay."""
+    v = arch.get(d, {}).get(key)
+    if v is None:
+        return None
+    vals = [arch[k][key] for k in arch if (k.month, k.day) == (d.month, d.day) and arch[k].get(key) is not None]
+    return 1 + sum(x > v for x in vals), len(vals)
+
+
+def month_view(arch, normals, year, month):
+    """Los días de un mes: [(día, máx, mín, lluvia, máx normal, mín normal)]."""
+    out = []
+    for dd in range(1, 32):
+        try:
+            d = date(year, month, dd)
+        except ValueError:
+            break
+        v, n = arch.get(d, {}), normals.get((month, dd), {})
+        out.append((dd, v.get("tmax"), v.get("tmin"), v.get("rain"), n.get("tmax"), n.get("tmin")))
+    return out
+
+
+def same_day_series(arch, month, day):
+    """Esa fecha en cada año: [(año, máx, mín)]."""
+    out = []
+    for y in sorted({d.year for d in arch}):
+        try:
+            v = arch.get(date(y, month, day))
+        except ValueError:
+            continue
+        if v and v.get("tmax") is not None:
+            out.append((y, v["tmax"], v.get("tmin")))
+    return out
+
+
+def astro_day(lat, lon, tz, d):
+    """Sol y Luna de cualquier fecha (calculado aquí, sin internet)."""
+    t0 = midnight(d, tz)
+    sr, ss = sun_rise_set(t0, lat, lon)
+    dawn, dusk = civil_twilight(t0, lat, lon)
+    mr, ms = moon_rise_set(t0, lat, lon)
+    il, el = moon_phase(t0 + 43200)
+    nxt = {}
+    for t, name in next_phases(t0, 32):
+        nxt.setdefault(name, t)
+    return {"sunrise": sr, "sunset": ss, "dawn": dawn, "dusk": dusk,
+            "daylight": ss - sr if sr and ss else None, "moonrise": mr, "moonset": ms,
+            "illum": il, "elong": el, "phase": phase_name(el), "next": nxt,
+            "polar": None if sr or ss else ("day" if sun_alt(t0 + 43200, lat, lon) > 0 else "night")}
+
+
+def local_day(loc, tz, d):
+    """Lo que guardó Clima Pi de ese día: tu sensor, lo observado y el marcador con la tele."""
+    out = {}
+    con = db(loc)
+    try:
+        r = con.execute("SELECT tmax, tmin FROM obs_day WHERE day = ?", (d.isoformat(),)).fetchone()
+        if r:
+            out["obs"] = r
+        r = con.execute("SELECT tv_max, tv_min, pi_max, pi_min FROM tele WHERE day = ?",
+                        (d.isoformat(),)).fetchone()
+        if r and None not in r:
+            out["tele"] = r
+    finally:
+        con.close()
+    t0, t1 = midnight(d, tz), midnight(d + timedelta(days=1), tz)
+    temp, hum = sensor_hourly(loc, t0, t1 - 1)
+    day = [v for t, v in temp.items() if t0 <= t < t1]
+    if len(day) >= 18:
+        out["sensor"] = (max(day), min(day), len(day))
+    return out
+
+
+def export_archive_csv(arch, path):
+    """Guarda todo el historial diario en un CSV (para abrirlo con LibreOffice, Excel…)."""
+    import csv
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["fecha", "max_C", "min_C", "media_C", "lluvia_mm"])
+        for d in sorted(arch):
+            v = arch[d]
+            w.writerow([d.isoformat()] + ["" if v.get(k) is None else f"{v[k]:.1f}"
+                                          for k in ("tmax", "tmin", "tmean", "rain")])
+    os.replace(tmp, path)
+    return len(arch)
 
 
 # ================================================================ gráficos
@@ -2709,7 +2893,10 @@ class Chart:
         if s.get("now") is not None:
             xn = X(s["now"])
             c.create_line(xn, T, xn, h - B, fill=WARN, dash=(3, 3))
-            c.create_text(xn + 4, T + 2, anchor="nw", text="ahora", fill=WARN, font=self.f_small)
+            lab = s.get("now_label", "ahora")
+            room = xn + 6 + self.f_small.measure(lab) < w - 2      # si no cabe a la derecha, a la izquierda
+            c.create_text(xn + 4 if room else xn - 4, T + 2, anchor="nw" if room else "ne", text=lab,
+                          fill=WARN, font=self.f_small)
 
         for se in s["series"]:
             if se.get("band") is not None:
@@ -2732,13 +2919,16 @@ class Chart:
         c = self.c
         c.delete("hover")
         s, g = self.spec, self.geo
-        if not s or not g or s.get("kind") != "line" or s.get("xkind") != "time":
+        if not s or not g or s.get("kind") != "line":
+            return
+        timed = s.get("xkind") == "time"
+        if not timed and not s.get("hover_head"):
             return
         x0, x1, y0, y1, L, R, T, B, w, h = g
         if not (L <= e.x <= w - R and T <= e.y <= h - B):
             return
         t = x0 + (e.x - L) / (w - L - R) * (x1 - x0)
-        t = int(round(t / 3600) * 3600)
+        t = int(round(t / 3600) * 3600) if timed else int(round(t))
         lines = []
         for se in s["series"]:
             if not se.get("label") or se.get("no_hover"):
@@ -2754,8 +2944,11 @@ class Chart:
             return
         xp = L + (t - x0) / (x1 - x0) * (w - L - R)
         c.create_line(xp, T, xp, h - B, fill=MUTED, tags="hover")
-        dt = datetime.fromtimestamp(t, s["tz"])
-        head = f"{DIAS_L[dt.weekday()]} {dt.day} · {dt:%H}:00"
+        if timed:
+            dt = datetime.fromtimestamp(t, s["tz"])
+            head = f"{DIAS_L[dt.weekday()]} {dt.day} · {dt:%H}:00"
+        else:
+            head = s["hover_head"](t)
         width = max([self.f_bold.measure(head)] +
                     [self.f_small.measure(f"{a}  {b}") + 18 for a, _, b in lines]) + 16
         height = 22 + 16 * len(lines)
@@ -2853,6 +3046,7 @@ class App:
         self.forecast_at = 0.0
         self.warnings = []
         self.last = None
+        self.archive, self.normals = {}, None
         self.f_small = tkfont.Font(family=FONT, size=9)
         self._style()
         self._build()
@@ -3000,6 +3194,12 @@ class App:
         st.map("Treeview", background=[("selected", "#2f6f4a")])
         st.map("Treeview.Heading", background=[("active", GRID)])
         st.configure("Vertical.TScrollbar", background=GRID, troughcolor=PANEL, borderwidth=0)
+        st.configure("TCombobox", fieldbackground=PANEL, background=GRID, foreground=FG,
+                     arrowcolor=FG, borderwidth=0)
+        st.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", FG)],
+               selectbackground=[("readonly", PANEL)], selectforeground=[("readonly", FG)])
+        self.root.option_add("*TCombobox*Listbox.background", PANEL)
+        self.root.option_add("*TCombobox*Listbox.foreground", FG)
 
     def _btn(self, parent, text, cmd):
         return tk.Button(parent, text=text, command=cmd, bg=PANEL, fg=FG,
@@ -3066,6 +3266,7 @@ class App:
         self._tab_astro(nb)
         self._tab_precision(nb)
         self._tab_history(nb)
+        self._tab_almanac(nb)
         self._tab_live(nb)
 
     def _tab_now(self, nb):
@@ -3217,6 +3418,90 @@ class App:
         self._wrap(self.hist_text)
         self.month_chart = Chart(f, 220)
         self.month_chart.c.pack(fill="both", expand=True)
+
+    def _tab_almanac(self, nb):
+        f = tk.Frame(nb, bg=BG)
+        nb.add(f, text="Almanaque")
+        self.alm_date = date.today()
+        bar = tk.Frame(f, bg=BG)
+        bar.pack(fill="x", pady=(8, 6))
+        self._btn(bar, "◀", lambda: self.alm_step(-1)).pack(side="left")
+        opts = dict(bg=PANEL, fg=FG, insertbackground=FG, buttonbackground=PANEL, relief="flat",
+                    font=(FONT, 11), justify="center", command=self.alm_from_inputs)
+        self.alm_day = tk.Spinbox(bar, from_=1, to=31, width=3, **opts)
+        self.alm_day.pack(side="left", padx=(6, 2), ipady=3)
+        self.alm_month = ttk.Combobox(bar, values=MESES_L, width=11, state="readonly", font=(FONT, 11))
+        self.alm_month.pack(side="left", padx=2)
+        self.alm_year = tk.Spinbox(bar, from_=HISTORY_START.year, to=date.today().year + 1, width=5, **opts)
+        self.alm_year.pack(side="left", padx=(2, 6), ipady=3)
+        for w in (self.alm_day, self.alm_year):
+            w.bind("<Return>", lambda e: self.alm_from_inputs())
+            w.bind("<FocusOut>", lambda e: self.alm_from_inputs())
+        self.alm_month.bind("<<ComboboxSelected>>", lambda e: self.alm_from_inputs())
+        self._btn(bar, "▶", lambda: self.alm_step(1)).pack(side="left")
+        self._btn(bar, "Hoy", self.alm_today).pack(side="left", padx=6)
+        self.alm_title = tk.Label(bar, text="", bg=BG, fg=FG, font=(FONT, 13, "bold"))
+        self.alm_title.pack(side="left", padx=12)
+        self._btn(bar, "Exportar CSV", self.alm_export).pack(side="right")
+
+        body = tk.Frame(f, bg=BG)
+        body.pack(fill="both", expand=True)
+        left = tk.Frame(body, bg=PANEL, width=430)
+        left.pack(side="left", fill="y", padx=(0, 6))
+        left.pack_propagate(False)
+        self.alm_sec = {}
+        for key, title in (("day", "Ese día"), ("astro", "Sol y Luna"), ("normal", "Lo normal"),
+                           ("records", "Récords de esta fecha")):
+            self._lbl(left, title, fg=MUTED, bold=True).pack(anchor="w", padx=12, pady=(10, 0))
+            lbl = self._lbl(left, "", size=10, justify="left", anchor="w", wraplength=400)
+            lbl.pack(anchor="w", fill="x", padx=12)
+            self.alm_sec[key] = lbl
+        right = tk.Frame(body, bg=BG)
+        right.pack(side="left", fill="both", expand=True)
+        self.alm_month_chart = Chart(right, 230)
+        self.alm_month_chart.c.pack(fill="both", expand=True, pady=(0, 6))
+        self.alm_years_chart = Chart(right, 230)
+        self.alm_years_chart.c.pack(fill="both", expand=True)
+        self._alm_sync_inputs()
+
+    def _alm_sync_inputs(self):
+        d = self.alm_date
+        for w, v in ((self.alm_day, d.day), (self.alm_year, d.year)):
+            w.delete(0, "end")
+            w.insert(0, str(v))
+        self.alm_month.current(d.month - 1)
+
+    def alm_from_inputs(self):
+        try:
+            y, m = int(self.alm_year.get()), self.alm_month.current() + 1
+            dd = int(self.alm_day.get())
+        except ValueError:
+            self._alm_sync_inputs()
+            return
+        y = min(max(y, HISTORY_START.year), date.today().year + 1)
+        last = (date(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1)).day
+        self.alm_date = date(y, m, min(max(dd, 1), last))     # 31 de abril → 30 de abril
+        self.show_almanac()
+
+    def alm_step(self, days):
+        self.alm_date += timedelta(days=days)
+        self.show_almanac()
+
+    def alm_today(self):
+        self.alm_date = datetime.now(self.tz).date()
+        self.show_almanac()
+
+    def alm_export(self):
+        if not self.archive or not self.loc:
+            self.set_status("Aún no hay historial que exportar (se descarga al reentrenar).", WARN)
+            return
+        name = "".join(ch if ch.isalnum() else "_" for ch in self.loc.get("name", "lugar"))
+        path = os.path.join(os.path.expanduser("~"), f"Clima_Pi_historial_{name}.csv")
+        try:
+            n = export_archive_csv(self.archive, path)
+            self.set_status(f"Historial exportado: {n:,} días en {path}", PI_C)
+        except OSError as e:
+            self.set_status(f"No se pudo exportar: {e}", BAD)
 
     def _tab_live(self, nb):
         f = tk.Frame(nb, bg=BG)
@@ -3508,6 +3793,9 @@ class App:
         self.month_chart.message("")
         for lbl in (self.acc_text, self.hist_text, self.tele_lbl, self.fc_note, self.phase_lbl):
             lbl.config(text="")
+        self.archive, self.normals = {}, None
+        self.show_almanac()
+        threading.Thread(target=self._load_archive, args=(dict(loc), self.key()), daemon=True).start()
         saved = load_model(loc)                     # lo aprendido en arranques anteriores
         if saved:
             log(f"Modelo Pi cargado del disco: {len(saved['models'])} modelos, entrenado el "
@@ -3534,11 +3822,20 @@ class App:
         self.forecast_at = now
         if retrain:
             self.trained_at = now
-        threading.Thread(target=self._job, args=(dict(self.loc), self.key(), retrain, self.trained,
-                                                 self.hist_chart.spec is None),
+        threading.Thread(target=self._job, args=(dict(self.loc), self.key(), retrain, self.trained),
                          daemon=True).start()
 
-    def _job(self, loc, key, retrain, trained, need_history=False):
+    def _load_archive(self, loc, key):
+        """El historial diario que ya está en el disco (sirve también sin internet)."""
+        try:
+            cached = _load_json(os.path.join(loc_dir(loc), "era5_diario.json"))
+            if cached:
+                tz = get_tz(loc)
+                self.q.put(("history", (climate_history(cached, tz), daily_archive(cached, tz)), key))
+        except Exception as e:                      # un archivo raro no debe parar nada
+            log(f"Historial en disco ilegible: {e}", "warn")
+
+    def _job(self, loc, key, retrain, trained):
         q = self.q
         t_job = time.perf_counter()
         log(f"══ ACTUALIZACIÓN {'con reentrenamiento ' if retrain else ''}· {loc_name(loc)} "
@@ -3619,13 +3916,10 @@ class App:
             if retrain:
                 try:
                     q.put(("status", "Descargando clima diario desde 1950 (solo la 1ª vez tarda)…", key))
-                    q.put(("history", climate_history(era5_daily(loc)), key))
+                    daily = era5_daily(loc)
+                    q.put(("history", (climate_history(daily, tz), daily_archive(daily, tz)), key))
                 except Exception as e:
                     q.put(("history_err", str(e), key))
-            elif need_history:                      # arranque con modelo guardado: usar el disco
-                cachedh = _load_json(os.path.join(loc_dir(loc), "era5_diario.json"))
-                if cachedh:
-                    q.put(("history", climate_history(cachedh), key))
             log(f"══ Actualización terminada en {time.perf_counter() - t_job:.1f} s", "head")
             q.put(("done", None, key))
         except Exception as e:
@@ -3753,7 +4047,10 @@ class App:
             self.acc_chart.message(f"No se pudo entrenar: {data}\nLo reintento en 30 minutos.")
             self.warnings.append(f"entrenamiento: {data}")
         elif kind == "history":
-            self.show_history(data)
+            hist, self.archive = data
+            self.normals = None                     # se recalculan al mirar el almanaque
+            self.show_history(hist)
+            self.show_almanac()
         elif kind == "history_err":
             self.hist_chart.message(f"No se pudo descargar el historial: {data}")
         elif kind == "retrain_later":           # sin red no se puede reentrenar: probar luego
@@ -4211,6 +4508,149 @@ class App:
                      f"entrenar. Referencia: reanálisis ERA5. Las noticias suelen basarse en estos "
                      f"mismos modelos; para la comparación directa usa el marcador de la pestaña Pronóstico.")
         self.acc_text.config(text="\n".join(lines))
+
+    # ---------- Almanaque
+    def show_almanac(self):
+        if not hasattr(self, "alm_title"):
+            return
+        d, tz, sec = self.alm_date, self.tz, self.alm_sec
+        self._alm_sync_inputs()
+        mes = MESES_L[d.month - 1]
+        self.alm_title.config(text=f"{DIAS_L[d.weekday()]} {d.day} de {mes} de {d.year}")
+        if not self.loc:
+            for lbl in sec.values():
+                lbl.config(text="")
+            sec["day"].config(text="Elige primero tu ciudad.")
+            return
+        arch = self.archive or {}
+        if arch and self.normals is None:
+            self.normals, self.normals_label = normals_table(arch)
+        normals = self.normals or {}
+        n = normals.get((d.month, d.day))
+
+        # --- ese día
+        lines, today = [], datetime.now(tz).date()
+        v = arch.get(d)
+        if v and v.get("tmax") is not None:
+            txt = f"Máxima {v['tmax']:.1f} °C · mínima {v['tmin']:.1f} °C"
+            if v.get("rain") is not None:
+                txt += f" · lluvia {v['rain']:.1f} mm"
+            lines.append(txt + "  (reanálisis ERA5)")
+            if n:
+                lines.append(f"Respecto a lo normal: máxima {v['tmax'] - n['tmax']:+.1f} °C, "
+                             f"mínima {v['tmin'] - n['tmin']:+.1f} °C")
+            rk = rank_of(arch, d, "tmax")
+            if rk:
+                lines.append(f"Su máxima fue la n.º {rk[0]} más alta de {rk[1]} años en esta fecha.")
+        elif d > today:
+            lines.append("Es futuro.")
+        elif not arch:
+            lines.append("El historial desde 1950 aún no se ha descargado (se hace al reentrenar; "
+                         "la primera vez tarda unos minutos).")
+        elif d > today - timedelta(days=7):
+            lines.append("ERA5 publica con unos 5 días de retraso.")
+        else:
+            lines.append("Sin datos de ERA5 para esa fecha.")
+        for dd in (self.last or {}).get("days", []):
+            if dd["date"] == d and d >= today:
+                lines.append(f"Pronóstico del Pi: máxima {dd['max']:.1f} °C · mínima {dd['min']:.1f} °C")
+        try:
+            loc_d = local_day(self.loc, tz, d)
+        except sqlite3.Error:
+            loc_d = {}
+        if "sensor" in loc_d:
+            mx, mn, nh = loc_d["sensor"]
+            lines.append(f"Tu sensor: máxima {mx:.1f} °C · mínima {mn:.1f} °C ({nh} horas medidas)")
+        if "obs" in loc_d and not v:
+            lines.append(f"Observado (modelo): máxima {loc_d['obs'][0]:.1f} °C · mínima {loc_d['obs'][1]:.1f} °C")
+        if "tele" in loc_d:
+            tvx, tvn, pix, pin = loc_d["tele"]
+            lines.append(f"Ese día apuntaste: tele {tvx:.0f}/{tvn:.0f} °C · Pi {pix:.0f}/{pin:.0f} °C")
+        sec["day"].config(text="\n".join(lines))
+
+        # --- sol y luna
+        a = astro_day(self.loc["latitude"], self.loc["longitude"], tz, d)
+        if a["polar"] == "day":
+            sun = "Sol de medianoche: no se pone en todo el día."
+        elif a["polar"] == "night":
+            sun = "Noche polar: el sol no sale."
+        else:
+            sun = (f"Sale {hhmm(a['sunrise'], tz)} · se pone {hhmm(a['sunset'], tz)} · "
+                   f"luz {int(a['daylight'] // 3600)} h {int(a['daylight'] % 3600 // 60)} min"
+                   if a["daylight"] else f"Sale {hhmm(a['sunrise'], tz)} · se pone {hhmm(a['sunset'], tz)}")
+        moon = f"Luna: {a['phase'].lower()} ({a['illum'] * 100:.0f} %) · sale {hhmm(a['moonrise'], tz)} · se pone {hhmm(a['moonset'], tz)}"
+        nxt = [f"{name.lower()} el {datetime.fromtimestamp(t, tz).day} de "
+               f"{MESES_L[datetime.fromtimestamp(t, tz).month - 1]}"
+               for name, t in sorted(a["next"].items(), key=lambda x: x[1])
+               if name in ("Luna llena", "Luna nueva")]
+        sec["astro"].config(text=f"{sun}\nAlba civil {hhmm(a['dawn'], tz)} · anochecer civil "
+                                 f"{hhmm(a['dusk'], tz)}\n{moon}" + (f"\nPróxima {', '.join(nxt)}" if nxt else ""))
+
+        # --- lo normal y los récords
+        if n:
+            txt = (f"Máxima {n['tmax']:.1f} °C · mínima {n['tmin']:.1f} °C  ({self.normals_label}, "
+                   f"±3 días)")
+            if n.get("rain_days") is not None:
+                txt += (f"\nLlueve (≥ 1 mm) {n['rain_days'] * 100:.0f} % de los años; "
+                        f"{n['rain']:.1f} mm de media")
+            sec["normal"].config(text=txt)
+        else:
+            sec["normal"].config(text="Hace falta el historial desde 1950.")
+        rec = day_records(arch, d.month, d.day) if arch else None
+        if rec:
+            def r_(x, unit="°C"):
+                return f"{x[0]:.1f} {unit} ({x[1]})" if x else "—"
+            sec["records"].config(text=(
+                f"Máxima más alta {r_(rec['max_high'])} · más baja {r_(rec['max_low'])}\n"
+                f"Mínima más baja {r_(rec['min_low'])} · más alta {r_(rec['min_high'])}\n"
+                f"Día más lluvioso {r_(rec['rain'], 'mm')}\n"
+                f"El {d.day} de {mes} de {rec['n']} años ({rec['first']}–{rec['last']})"))
+        else:
+            sec["records"].config(text="Hace falta el historial desde 1950.")
+
+        # --- gráficas
+        if not arch:
+            msg = "El historial desde 1950 se descarga al reentrenar\n(la primera vez tarda unos minutos)."
+            self.alm_month_chart.message(msg)
+            self.alm_years_chart.message("")
+            return
+        mv = month_view(arch, normals, d.year, d.month)
+        fc = [(dd["date"].day, dd["max"], dd["min"]) for dd in (self.last or {}).get("days", [])
+              if (dd["date"].year, dd["date"].month) == (d.year, d.month) and dd["date"] >= today
+              and not arch.get(dd["date"])]
+        se = []
+        band = [(x, lo, hi) for x, _, _, _, hi, lo in mv if lo is not None]
+        if band:
+            se.append({"label": "Lo normal (mín.–máx.)", "color": BAND_C, "legend_color": "#3f6e52",
+                       "band": band, "pts": []})
+        se.append({"label": "Máxima", "color": BAD, "width": 2,
+                   "pts": [(x, mx) for x, mx, *_ in mv]})
+        se.append({"label": "Mínima", "color": COLD, "width": 2,
+                   "pts": [(x, mn) for x, _, mn, *_ in mv]})
+        if fc:                                       # los días que aún no han pasado
+            se.append({"label": "Pronóstico (máx./mín.)", "color": PI_C, "width": 2, "dash": (4, 3),
+                       "pts": [(x, mx) for x, mx, _ in fc]})
+            se.append({"color": PI_C, "width": 2, "dash": (4, 3), "pts": [(x, mn) for x, _, mn in fc]})
+        if any(x[1] is not None for x in mv) or fc or band:
+            self.alm_month_chart.show({
+                "kind": "line", "xkind": "num", "unit": "°", "series": se, "xrange": (1, len(mv)),
+                "now": d.day, "now_label": str(d.day),
+                "hover_head": lambda x: f"{x} de {mes} de {d.year}",
+                "title": f"{mes.capitalize()} de {d.year}: máxima y mínima de cada día"})
+        else:
+            self.alm_month_chart.message(f"Sin datos de {mes} de {d.year} todavía.")
+        yrs = same_day_series(arch, d.month, d.day)
+        if yrs:
+            self.alm_years_chart.show({
+                "kind": "line", "xkind": "year", "unit": "°", "now": d.year, "now_label": str(d.year),
+                "xrange": (min(yrs[0][0], d.year), max(yrs[-1][0], d.year)),
+                "hover_head": lambda y: f"{d.day} de {mes} de {y}",
+                "title": f"El {d.day} de {mes} cada año desde {yrs[0][0]}",
+                "series": [{"label": "Máxima", "color": BAD, "width": 1.5, "pts": [(y, a) for y, a, _ in yrs]},
+                           {"label": "Mínima", "color": COLD, "width": 1.5,
+                            "pts": [(y, b) for y, _, b in yrs]}]})
+        else:
+            self.alm_years_chart.message("Sin datos de esta fecha.")
 
     # ---------- Clima histórico
     def show_history(self, h):

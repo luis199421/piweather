@@ -11,7 +11,8 @@ cualquier PC con Python 3.9+) que hace tu propio pronóstico del tiempo:
   los que mejor aciertan (técnica tipo MOS).
 * **Opcional: un sensor DHT22.** Si lo conectas, corrige el pronóstico para tu sitio exacto y,
   **sin internet**, sigue pronosticando. Si no lo conectas, todo funciona igual que siempre.
-* Pestañas: Ahora · Pronóstico · Por horas · Sol y Luna · Precisión · Clima histórico · En vivo.
+* Pestañas: Ahora · Pronóstico · Por horas · Sol y Luna · Precisión · Clima histórico ·
+  **Almanaque** · En vivo.
 
 ## Instalar (o actualizar desde la 2.5)
 
@@ -58,6 +59,29 @@ python3 ~/.local/share/clima-pi/clima_pi.py --sensor-test    # comprobar el DHT2
 Datos en `~/.clima_pi/`. Datos meteorológicos: Open-Meteo.com (CC BY 4.0).
 
 ---
+
+## Qué cambió en la versión 2.8: pestaña Almanaque
+
+Un archivo de tu clima: eliges **cualquier fecha desde 1950** (◀ ▶, día/mes/año u «Hoy») y ves:
+
+* **Ese día:** máxima, mínima y lluvia (reanálisis ERA5), cuánto se separó de lo normal y en
+  qué puesto quedó entre todos los años («la n.º 1 más alta de 76»); y lo que guardó Clima Pi:
+  lo que midió tu sensor, lo observado y lo que apuntaste en «Pi contra la tele». Si es una
+  fecha futura de esta semana, el pronóstico del Pi.
+* **Sol y Luna** de esa fecha (calculado en el Pi, sin internet): salida y puesta, alba y
+  anochecer civil, horas de luz, fase, salida y puesta de la Luna, próximas luna llena y nueva.
+* **Lo normal** (1991–2020, ±3 días): máxima, mínima y cuántos años llueve ese día.
+* **Récords de esa fecha:** máxima más alta y más baja, mínima más baja y más alta, día más
+  lluvioso, con su año.
+* Dos gráficas: **el mes** día a día sobre la banda de lo normal (con el pronóstico en los días
+  que aún no han pasado) y **esa fecha cada año** desde 1950. Pasa el ratón para ver cada valor.
+* **Exportar CSV**: todo el historial diario a `~/Clima_Pi_historial_<ciudad>.csv`.
+
+Para esto el historial diario ahora trae máxima, mínima y lluvia (antes solo la media), y los
+días son **de tu hora**, no de la UTC (el 1 de enero es tu 1 de enero). Cuesta lo mismo en la
+API, pero **la primera vez vuelve a descargar el historial desde 1950** (unos minutos, en
+segundo plano). Mientras tanto, y sin internet, el almanaque ya enseña el sol, la luna y lo que
+guardó Clima Pi.
 
 ## Qué cambió en la versión 2.7: modelos de inteligencia artificial
 
@@ -219,7 +243,7 @@ pestaña Precisión y con `--backtest` (y la del sensor, en el registro «En viv
 python3 -m unittest discover -s tests -v
 ```
 
-69 pruebas, sin red, sin ventana y sin sensor de verdad (un DHT22 simulado con los archivos
+78 pruebas, sin red, sin ventana y sin sensor de verdad (un DHT22 simulado con los archivos
 que crea Linux), en ~30 s. Usan un mundo meteorológico sintético con el formato exacto de
 las respuestas de Open-Meteo (`tests/sintetico.py`): 11 modelos con su sesgo, su sesgo
 día/noche que cambia con la estación, error que crece con la antelación (en parte común a
@@ -233,6 +257,11 @@ pide, los 2 de IA de NOAA (un dato cada 6 h, historial corto, ciclo día/noche a
 * **Modelos de IA de 6 en 6 h:** el relleno conserva el ciclo de los demás y no inventa
   fuera de sus datos; se usan aunque tengan poco historial; si aportan, mejoran el pronóstico
   (y el relleno nuevo es necesario para ello); el desglose sigue sumando exacto.
+* **Almanaque:** fechas de tu hora (también el 1 de enero en Madrid, que en UTC es aún
+  el 31 de diciembre); lo normal 1991–2020; récords con su año (puestos a mano en los datos);
+  el 29 de febrero; meses de 28, 29 y 31 días; sol de medianoche y noche polar; lo guardado
+  por el sensor y el marcador; exportar CSV; y que con el historial de la 2.7 (solo la media)
+  se vuelve a descargar con tu hora y todas las variables.
 * **Hora local:** todas las horas de un año con sus cambios de hora, comparadas con `zoneinfo`.
 * **Sol y Luna:** salida y puesta del sol en Madrid, Londres y Sídney (±3 min de lo publicado),
   sol de medianoche y noche polar en Tromsø, fases de la Luna de 2024 (±20 min).
