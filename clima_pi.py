@@ -15,9 +15,14 @@ Qué hace:
     "Pi contra la tele".
   * Pestañas: Ahora · Pronóstico · Por horas · Sol y Luna · Precisión · Clima histórico.
   * Se queda funcionando: actualiza cada hora y reentrena cada día.
+  * Opcional, un sensor DHT22: corrige el pronóstico para tu sitio exacto y, sin internet,
+    sigue pronosticando con lo que mide y con lo último que se descargó. Sin sensor no cambia nada.
 
 Ejecutar:
-    python3 clima_pi.py
+    python3 clima_pi.py                  la ventana
+    python3 clima_pi.py --offline        sin usar internet aunque lo haya
+    python3 clima_pi.py --backtest       prueba de precisión con lo descargado (sin ventana)
+    python3 clima_pi.py --sensor-test    comprobar el DHT22
 Si falta algo:
     sudo apt install python3-tk python3-numpy
 
@@ -26,7 +31,7 @@ Open-Meteo). Después solo descarga lo nuevo. Datos en ~/.clima_pi/
 Datos meteorológicos: Open-Meteo.com (CC BY 4.0).
 """
 
-import bisect
+import http.client
 import importlib.util
 import json
 import math
@@ -38,15 +43,19 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
 
-import tkinter as tk
-import tkinter.font as tkfont
-from tkinter import ttk
+try:                             # sin tkinter aún se puede usar el motor (pruebas, --backtest)
+    import tkinter as tk
+    import tkinter.font as tkfont
+    from tkinter import ttk
+except ImportError:
+    tk = tkfont = ttk = None
 
 try:
     import numpy as np
@@ -77,9 +86,12 @@ APP = ("app", "App típica (Open-Meteo)", ["best_match"], "#e2e8f0")
 NAMES = {k: n for k, n, _, _ in MODELS + [APP]}
 COLORS = {k: c for k, _, _, c in MODELS + [APP]}
 
-LEADS = range(1, 8)                  # días de antelación
+# Días de antelación. Según Open-Meteo, «temperature_2m_previous_dayN» es lo que el modelo
+# predecía N×24 h antes de la hora válida, y «temperature_2m» (día 0) la pasada más reciente.
+LEADS = range(0, 8)
 FORECAST_EVERY_S = 3600              # actualizar pronóstico cada hora
 RETRAIN_EVERY_S = 24 * 3600          # reentrenar cada día
+OFFLINE_FORCED = False               # --offline: no usar internet aunque lo haya
 PREV_RUNS_START = date(2024, 1, 15)  # archivo de pronósticos pasados
 HISTORY_START = date(1950, 1, 1)
 RATE_PER_MIN = 420                   # Open-Meteo permite 600 llamadas/minuto
@@ -245,9 +257,14 @@ def get_json(base, params, timeout=90):
                 log("← 429: demasiadas peticiones; espero 65 s y reintento", "warn")
                 time.sleep(65)
                 continue
+            if e.code >= 500 and attempt < 3:          # fallo pasajero del servidor
+                log(f"← error {e.code} del servidor; reintento {attempt + 1}/3 en {10 * attempt} s", "warn")
+                time.sleep(10 * attempt)
+                continue
             log(f"← error {e.code}: {reason or e.reason}", "err")
             raise RuntimeError(f"Open-Meteo respondió {e.code}: {reason or e.reason}")
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException,
+                ValueError) as e:                      # ValueError: JSON cortado o corrupto
             if attempt == 3:
                 log(f"← sin conexión: {e}", "err")
                 raise RuntimeError(f"sin conexión con Open-Meteo ({e})")
@@ -293,10 +310,13 @@ def loc_dir(loc):
     return d
 
 
-def _save_json(path, data):
+def _save_json(path, data, **kw):
+    """Escritura atómica: si se va la luz a mitad, queda el archivo anterior entero."""
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(data, f)
+        json.dump(data, f, **kw)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
 
 
@@ -330,14 +350,23 @@ def merge_section(old, new):
     return out
 
 
-def update_history(path, section, full_start, end, fetch, chunk_days, max_age):
-    """Historial incremental: la 1ª vez lo descarga por trozos; luego solo lo nuevo."""
+def update_history(path, section, full_start, end, fetch, chunk_days, max_age, required=()):
+    """Historial incremental: la 1ª vez lo descarga por trozos; luego solo lo nuevo.
+
+    `required`: variables que debe tener el archivo; si falta alguna (versión anterior del
+    programa) se vuelve a descargar entero."""
     data = _load_json(path) or {}
     sec = data.get(section)
     name = os.path.basename(path)
+    if sec and sec.get("time") and any(v not in sec for v in required):
+        log(f"Disco: {name} es de una versión anterior (le faltan variables); lo descargo de nuevo")
+        sec = None
     if sec and sec.get("time"):
         last = datetime.fromtimestamp(sec["time"][-1], timezone.utc).date()
-        if time.time() - os.path.getmtime(path) < max_age or last >= end:
+        # la antigüedad del archivo solo vale si llega casi hasta el final: una descarga que se
+        # cortó a medias también es reciente, y no debe darse por buena
+        recent = time.time() - os.path.getmtime(path) < max_age and (end - last).days <= 7
+        if recent or last >= end:
             log(f"Disco: {name} al día ({len(sec['time']):,} registros hasta {last})")
             return data
         start = max(full_start, last - timedelta(days=3))
@@ -386,11 +415,16 @@ def era5_daily(loc):
                           2400, 6 * 86400)
 
 
+def lead_var(L):
+    """Variable de la API de pasadas anteriores para L días de antelación."""
+    return "temperature_2m" if L == 0 else f"temperature_2m_previous_day{L}"
+
+
 def prev_runs(loc, key, ids):
-    """Pronósticos pasados de un modelo (1..7 días de antelación). Prueba cada id."""
+    """Pronósticos pasados de un modelo (0..7 días de antelación). Prueba cada id."""
     end = date.today() - timedelta(days=6)
     start = max(PREV_RUNS_START, end - timedelta(days=640))
-    hourly = ",".join(f"temperature_2m_previous_day{L}" for L in LEADS)
+    hourly = ",".join(lead_var(L) for L in LEADS)
     last_err = None
     for mid in ids:
         path = os.path.join(loc_dir(loc), f"pasados_{key}_{mid}.json")
@@ -400,7 +434,8 @@ def prev_runs(loc, key, ids):
                                            hourly=hourly, models=mid, timeformat="unixtime"),
                             timeout=180)
         try:
-            data = update_history(path, "hourly", start, end, fetch, 400, 20 * 3600)
+            data = update_history(path, "hourly", start, end, fetch, 400, 20 * 3600,
+                                  required=hourly.split(","))
         except RuntimeError as e:
             last_err = e
             continue
@@ -445,7 +480,7 @@ def extras_forecast(loc):
 
 # ---------------------------------------------------------------- segundo plano, arranque e icono
 APP_ID = "clima-pi"
-APP_VERSION = "2.5"                         # si arranca una versión distinta, sustituye a la que corre
+APP_VERSION = "2.6"                         # si arranca una versión distinta, sustituye a la que corre
 WM_CLASS = "Clima-pi"                       # Tk pone en mayúscula la 1ª letra de className
 TRAY_PKGS = "gir1.2-ayatanaappindicator3-0.1 python3-gi python3-pil"
 
@@ -505,23 +540,93 @@ def start_command_server(q):
     srv.bind(sock_path())
     srv.listen(4)
 
+    def serve(conn):
+        with conn:
+            conn.settimeout(2)
+            try:
+                cmd = conn.recv(256).decode().strip()
+                if cmd == "version":
+                    reply = f"ok {APP_VERSION} {os.getpid()}"
+                elif cmd == "ping" or not cmd:
+                    reply = "ok"
+                else:
+                    # la respuesta la da la propia ventana: si está colgada no llega, y quien
+                    # pregunta sabe que hay que sustituirla
+                    done = threading.Event()
+                    q.put(("cmd", cmd, done))
+                    reply = "ok" if done.wait(10) else "busy"
+                conn.settimeout(12)
+                conn.sendall((reply + "\n").encode())
+            except OSError:
+                pass
+
     def loop():
         while True:
             try:
                 conn, _ = srv.accept()
             except OSError:
                 return
-            with conn:
-                conn.settimeout(2)
-                try:
-                    cmd = conn.recv(256).decode().strip()
-                    if cmd:
-                        q.put(("cmd", cmd, None))
-                        conn.sendall((f"ok {APP_VERSION}\n" if cmd == "version" else "ok\n").encode())
-                except OSError:
-                    pass
+            threading.Thread(target=serve, args=(conn,), daemon=True).start()
     threading.Thread(target=loop, daemon=True).start()
     return srv
+
+
+def other_instances():
+    """PID de otras ventanas de Clima Pi de este usuario (cualquier versión, no el icono)."""
+    me, out = os.getpid(), []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit() and int(p) != me]
+    except OSError:
+        return out
+    for pid in pids:
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = [a for a in f.read().decode(errors="replace").split("\0") if a]
+        except OSError:
+            continue
+        if (argv and "python" in os.path.basename(argv[0]) and "--tray" not in argv
+                and "--backtest" not in argv and any(a.endswith("clima_pi.py") for a in argv)):
+            out.append(int(pid))
+    return out
+
+
+def stop_instance(pid=None):
+    """Cierra a la fuerza la copia que no responde (primero con educación, luego no)."""
+    import signal
+    pids = [pid] if pid else other_instances()
+    for sig, wait in ((signal.SIGTERM, 3), (signal.SIGKILL, 2)):
+        alive = []
+        for p in pids:
+            try:
+                os.kill(p, sig)
+                alive.append(p)
+            except OSError:
+                pass
+        end = time.time() + wait
+        while alive and time.time() < end:
+            alive = [p for p in alive if pid_alive(p)]
+            time.sleep(0.1)
+        if not alive:
+            return True
+        pids = alive
+    return False
+
+
+def log_to_file():
+    """Abierto desde el menú o al encender no hay terminal: los errores van a ~/.clima_pi/ventana.log."""
+    if sys.stderr is not None and sys.stderr.isatty():
+        return
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        path = os.path.join(DATA_DIR, "ventana.log")
+        mode = "w" if os.path.exists(path) and os.path.getsize(path) > 256 * 1024 else "a"
+        sys.stderr = open(path, mode, buffering=1)
+        print(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} Clima Pi {APP_VERSION} (pid {os.getpid()})",
+              file=sys.stderr)
+    except OSError:
+        pass
 
 
 def have_pil():
@@ -853,8 +958,7 @@ def load_config():
 
 def save_config(loc):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(os.path.join(DATA_DIR, "config.json"), "w") as f:
-        json.dump({"location": loc}, f, ensure_ascii=False, indent=1)
+    _save_json(os.path.join(DATA_DIR, "config.json"), {"location": loc}, ensure_ascii=False, indent=1)
 
 
 def get_tz(loc):
@@ -1051,10 +1155,17 @@ def local_parts(ts, tz):
     """Día del año (0..365), hora local y nº de día local para un array de timestamps."""
     ts = np.asarray(ts, dtype=np.int64)
     days = ts // 86400
+
+    def off(t):
+        return datetime.fromtimestamp(int(t), tz).utcoffset().total_seconds()
     uniq, inv = np.unique(days, return_inverse=True)
-    offs = np.array([tz.utcoffset(datetime.fromtimestamp(int(d) * 86400 + 43200, timezone.utc))
-                     .total_seconds() for d in uniq], dtype=np.int64)
-    lt = ts + offs[inv]
+    o0 = np.array([off(d * 86400) for d in uniq], dtype=np.int64)
+    o1 = np.array([off(d * 86400 + 86399) for d in uniq], dtype=np.int64)
+    offs = o0[inv]
+    change = (o0 != o1)[inv]                       # días con cambio de hora: hora a hora
+    if change.any():
+        offs[change] = [off(t) for t in ts[change]]
+    lt = ts + offs
     hour = ((lt // 3600) % 24).astype(int)
     dayno = lt // 86400
     dd = dayno.astype("datetime64[D]")
@@ -1077,6 +1188,13 @@ def build_climatology(truth, tz):
     return clim
 
 
+def row_mean(M):
+    cnt = np.isfinite(M).sum(axis=1)
+    s = np.where(np.isfinite(M), M, 0).sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(cnt > 0, s / np.maximum(cnt, 1), np.nan)
+
+
 def impute(M):
     """Rellena huecos (modelo sin dato a esa hora) con la media de los demás modelos."""
     M = M.copy()
@@ -1086,11 +1204,8 @@ def impute(M):
     return M
 
 
-def row_mean(M):
-    cnt = np.isfinite(M).sum(axis=1)
-    s = np.where(np.isfinite(M), M, 0).sum(axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return np.where(cnt > 0, s / np.maximum(cnt, 1), np.nan)
+CORR_NAMES = ["Normal para la fecha", "Hora del día", "Hora del día", "Época del año", "Época del año",
+              "Ajuste día/noche", "Ajuste día/noche", "Desacuerdo entre modelos"]
 
 
 def features(Mi, doy, hour, clim):
@@ -1109,15 +1224,23 @@ class Ridge:
     def fit(self, X, y, lam=2.0):
         self.mu = X.mean(axis=0)
         self.sd = X.std(axis=0)
-        self.sd[self.sd == 0] = 1.0
+        self.sd[self.sd < 1e-9] = 1.0
         Z = np.column_stack([np.ones(len(X)), (X - self.mu) / self.sd])
         A = Z.T @ Z + lam * np.eye(Z.shape[1])
-        A[0, 0] -= lam
-        self.w = np.linalg.solve(A, Z.T @ y)
+        A[0, 0] -= lam                              # la constante no se penaliza
+        try:
+            self.w = np.linalg.solve(A, Z.T @ y)
+        except np.linalg.LinAlgError:               # columnas repetidas: mínimos cuadrados
+            self.w = np.linalg.lstsq(A, Z.T @ y, rcond=None)[0]
         return self
 
     def predict(self, X):
         return self.w[0] + ((X - self.mu) / self.sd) @ self.w[1:]
+
+    def raw(self):
+        """(constante, pesos) para los datos tal cual: predicción = constante + pesos · x."""
+        b = self.w[1:] / self.sd
+        return float(self.w[0] - np.sum(b * self.mu)), b
 
     def to_dict(self):
         return {"mu": self.mu.tolist(), "sd": self.sd.tolist(), "w": self.w.tolist()}
@@ -1130,7 +1253,7 @@ class Ridge:
 
 
 # ---------------------------------------------------------------- guardar lo aprendido
-MODEL_VERSION = 2
+MODEL_VERSION = 3
 MODEL_SIGNATURE = [k for k, *_ in MODELS]       # si cambia la lista de modelos, se reentrena
 
 
@@ -1161,6 +1284,8 @@ def load_model(loc):
             x = dict(info)
             x["model"] = Ridge.from_dict(info["model"])
             x["daily"] = {k: Ridge.from_dict(m) for k, m in info.get("daily", {}).items()}
+            if len(x["model"].w) != len(x["use"]) + len(CORR_NAMES) + 1:
+                return None
             leads[int(L)] = x
         return {"clim": np.array(d["clim"], dtype=float), "leads": leads,
                 "trained_at": d["trained_at"], "start": d["start"], "models": d["models"]}
@@ -1223,7 +1348,7 @@ def train(era5_resp, prev, app_resp, tz):
     truth_v = np.array([truth[t] for t in truth_ts])
 
     for L in LEADS:
-        var = f"temperature_2m_previous_day{L}"
+        var = lead_var(L)
         fc = {k: series(prev[k], "hourly", var) for k in prev}
         use = [k for k, *_ in MODELS if len(fc.get(k, {})) > 24 * 45]
         if not use:
@@ -1238,15 +1363,16 @@ def train(era5_resp, prev, app_resp, tz):
             continue
         ts, y, M = truth_ts[ok], truth_v[ok], M[ok]
         doy, hour, dayno = local_parts(ts, tz)
-        Mi = impute(M)
-        X = features(Mi, doy, hour, clim)
-        good = np.isfinite(X).all(axis=1) & np.isfinite(y)
-        ts, y, M, Mi, X, doy, hour, dayno = (a[good] for a in (ts, y, M, Mi, X, doy, hour, dayno))
+        good = np.isfinite(y) & np.isfinite(clim[doy, hour])
+        ts, y, M, doy, hour, dayno = (a[good] for a in (ts, y, M, doy, hour, dayno))
         n = len(y)
         cut = int(n * 0.8)
         cut = int(np.searchsorted(dayno, dayno[cut]))          # cortar en un cambio de día
 
+        # --- prueba justa: se entrena con el 80 % más antiguo y se mide en el resto
         t0 = time.perf_counter()
+        Mi = impute(M)
+        X = features(Mi, doy, hour, clim)
         pred = Ridge().fit(X[:cut], y[:cut]).predict(X[cut:])
         t_fit = 1000 * (time.perf_counter() - t0)
         yt, dt = y[cut:], dayno[cut:]
@@ -1268,6 +1394,9 @@ def train(era5_resp, prev, app_resp, tz):
             mx, mn, nd = daily_extremes_mae(dt, yt, p)
             if mx is not None:
                 mae_max[k], mae_min[k] = mx, mn
+        res = pred - yt
+        q10, q90 = (float(v) for v in np.percentile(res, [10, 90]))
+
 
         # --- modelos propios de máxima y mínima del día (lo que dan las noticias)
         daily_models = {}
@@ -1286,11 +1415,12 @@ def train(era5_resp, prev, app_resp, tz):
 
         out["leads"][L] = {"model": Ridge().fit(X, y), "use": use, "mae": mae,
                            "mae_max": mae_max, "mae_min": mae_min, "n": n, "daily": daily_models,
+                           "q10": q10, "q90": q90,
                            "n_test": n - cut, "test_from": int(ts[cut]), "test_to": int(ts[-1])}
         best = min((k for k in mae if k in NAMES and k != "app"), key=mae.get, default=None)
         log(f"  {L} día(s) de antelación: {n:,} horas × {X.shape[1]} variables "
-            f"({len(use)} modelos + 8 correcciones) → sistema {X.shape[1] + 1}×{X.shape[1] + 1} "
-            f"resuelto en {t_fit:.0f} ms", "train")
+            f"({len(use)} modelos + {len(CORR_NAMES)} correcciones) → sistema {X.shape[1] + 1}×"
+            f"{X.shape[1] + 1} resuelto en {t_fit:.0f} ms", "train")
         log(f"      prueba con {n - cut:,} horas no vistas: Pi {mae['pi']:.2f} °C · media "
             f"{mae.get('consenso', float('nan')):.2f} · mejor modelo "
             f"{SHORT.get(best, best)} {mae.get(best, float('nan')):.2f}"
@@ -1305,7 +1435,105 @@ def train(era5_resp, prev, app_resp, tz):
 
 
 # ---------------------------------------------------------------- pronóstico
-def make_forecast(live, extras, trained, tz, now, loc):
+def lead_mix(x, avail):
+    """Para x días de antelación (fraccionarios) devuelve (L inferior, L superior, peso del superior).
+
+    Un pronóstico a 30 h está entre el modelo de 1 día (24 h) y el de 2 días (48 h): se mezclan."""
+    avail = np.array(sorted(avail))
+    x = np.clip(np.asarray(x, dtype=float), avail[0], avail[-1])
+    hi_i = np.clip(np.searchsorted(avail, x, side="left"), 0, len(avail) - 1)
+    lo_i = np.where(avail[hi_i] > x, hi_i - 1, hi_i)
+    lo, hi = avail[np.maximum(lo_i, 0)], avail[hi_i]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        w = np.where(hi > lo, (x - lo) / np.maximum(hi - lo, 1e-9), 0.0)
+    return lo, hi, w
+
+
+def _lead_matrix(info, temps, ts):
+    use = info["use"]
+    M = np.full((len(ts), len(use)), np.nan)
+    for j, k in enumerate(use):
+        d = temps.get(k, {})
+        M[:, j] = [d.get(int(t), np.nan) for t in ts]
+    enough = np.isfinite(M).sum(axis=1) >= max(1, (len(use) + 1) // 2)
+    return M, enough
+
+
+def predict_lead(info, temps, ts, doy, hour, clim):
+    """Predicción horaria con el modelo de una antelación; NaN donde faltan modelos."""
+    M, enough = _lead_matrix(info, temps, ts)
+    p = np.full(len(ts), np.nan)
+    if enough.any():
+        X = features(impute(M[enough]), doy[enough], hour[enough], clim)
+        with np.errstate(invalid="ignore"):
+            p[enough] = info["model"].predict(X)
+    return p, M
+
+
+def predict_pi(trained, temps, ts, now, tz):
+    """Modelo Pi para cada hora de `ts`, mezclando las dos antelaciones más cercanas."""
+    ts = np.asarray(ts, dtype=np.int64)
+    leads = trained["leads"]
+    lo, hi, w = lead_mix((ts - now) / 86400.0, list(leads))
+    doy, hour, _ = local_parts(ts, tz)
+    P = {}
+    for L in sorted(set(lo.tolist()) | set(hi.tolist())):
+        P[L], M = predict_lead(leads[L], temps, ts, doy, hour, trained["clim"])
+        sel = (lo == L) | (hi == L)
+        ok = np.isfinite(P[L]) & sel
+        if ok.any():
+            log(f"PREDICCIÓN modelo de {L} día(s): {int(ok.sum())} horas × {len(leads[L]['use'])} "
+                f"modelos → {P[L][ok].min():.1f} a {P[L][ok].max():.1f} °C (media de los modelos "
+                f"{np.nanmin(row_mean(M[ok])):.1f} a {np.nanmax(row_mean(M[ok])):.1f})")
+    plo = np.array([P[L][i] for i, L in enumerate(lo)])
+    phi = np.array([P[L][i] for i, L in enumerate(hi)])
+    out = np.where(np.isfinite(plo) & np.isfinite(phi), (1 - w) * plo + w * phi,
+                   np.where(np.isfinite(plo), plo, phi))
+    return out
+
+
+def predict_daily(trained, temps, t0, now, tz, hours=24):
+    """Máxima y mínima de un día con los modelos diarios, mezclando antelaciones."""
+    hrs = np.array([int(t0 + h * 3600) for h in range(hours)], dtype=np.int64)
+    leads = {L: i for L, i in trained["leads"].items() if i.get("daily")}
+    if not leads:
+        return {}, []
+    lo, hi, w = lead_mix([float(np.mean(hrs - now)) / 86400.0], list(leads))
+    lo, hi, w = int(lo[0]), int(hi[0]), float(w[0])
+    out, parts = {}, []
+    for kind in ("max", "min"):
+        acc, wsum, info_f = 0.0, 0.0, None
+        for L, wl in ((lo, 1 - w), (hi, w)):
+            info = leads[L]
+            mdl = info["daily"].get(kind)
+            if mdl is None or (wl <= 0 and lo != hi):
+                continue
+            M, ok = _lead_matrix(info, temps, hrs)
+            if ok.sum() < 20:
+                continue
+            Mi = impute(M[ok])
+            d_, h_, _ = local_parts(hrs[ok], tz)
+            cv = trained["clim"][d_, h_]
+            F = (Mi.max(axis=0) if kind == "max" else Mi.min(axis=0))[None, :]
+            c = np.array([np.nanmax(cv) if kind == "max" else np.nanmin(cv)])
+            Xd = daily_features(F, c, np.array([d_[0]]))
+            if np.isfinite(Xd).all():
+                acc += max(wl, 1e-9) * float(mdl.predict(Xd)[0])
+                wsum += max(wl, 1e-9)
+                info_f = (F, c)
+        if wsum > 0:
+            out[kind] = acc / wsum
+            F, c = info_f
+            parts.append(f"{'máx' if kind == 'max' else 'mín'} {out[kind]:.1f} °C "
+                         f"(modelos {F.min():.1f}–{F.max():.1f}, normal {c[0]:.1f})")
+    return out, parts
+
+
+def make_forecast(live, extras, trained, tz, now, loc, correct=None, sensor_obs=None):
+    """Junta todo en el resultado que pinta la ventana.
+
+    correct: función opcional (la da el sensor) que recibe lo que predijo el Pi para las últimas
+    horas y devuelve cuánto corregir cada hora futura. sensor_obs: lo medido por el sensor."""
     temps = {k: series(r, "hourly", "temperature_2m") for k, r in live.items()}
     temps = {k: v for k, v in temps.items() if v}
     xs = {v: series(extras, "hourly", v) for v in EXTRA_HOURLY.split(",")} if extras else {}
@@ -1318,36 +1546,12 @@ def make_forecast(live, extras, trained, tz, now, loc):
     fut = np.array([t for t in all_ts if now < t <= now + 7 * 86400], dtype=np.int64)
 
     # --- Modelo Pi
-    pi = {}
-    if trained and fut.size and order:
-        leads = trained["leads"]
-        lead_arr = np.clip((fut - now) // 86400 + 1, 1, 7).astype(int)
-        doy, hour, _ = local_parts(fut, tz)
-        for L in LEADS:
-            idx = np.where(lead_arr == L)[0]
-            if not idx.size:
-                continue
-            info = leads.get(L) or leads[min(leads, key=lambda k: abs(k - L))]
-            use = info["use"]
-            M = np.full((len(idx), len(use)), np.nan)
-            for j, k in enumerate(use):
-                d = temps.get(k, {})
-                M[:, j] = [d.get(int(fut[i]), np.nan) for i in idx]
-            enough = np.isfinite(M).sum(axis=1) >= max(1, (len(use) + 1) // 2)
-            if not enough.any():
-                continue
-            Mi = impute(M)
-            X = features(Mi, doy[idx], hour[idx], trained["clim"])
-            with np.errstate(invalid="ignore"):
-                p = info["model"].predict(X)
-            ok_p = p[np.isfinite(p)]
-            if ok_p.size:
-                log(f"PREDICCIÓN +{L} día(s): {int(enough.sum())} horas × {len(use)} modelos → "
-                    f"{ok_p.min():.1f} a {ok_p.max():.1f} °C (media de los modelos "
-                    f"{np.nanmin(row_mean(M)):.1f} a {np.nanmax(row_mean(M)):.1f})")
-            for kk, i in enumerate(idx):
-                if enough[kk] and np.isfinite(p[kk]):
-                    pi[int(fut[i])] = float(p[kk])
+    pi, pi_ref = {}, {}
+    ref = np.array([t for t in all_ts if now - 3 * 3600 < t <= now], dtype=np.int64)
+    if trained and trained["leads"] and fut.size and order:
+        p = predict_pi(trained, temps, np.r_[ref, fut], now, tz)
+        pi = {int(t): float(v) for t, v in zip(fut, p[len(ref):]) if np.isfinite(v)}
+        pi_ref = {int(t): float(v) for t, v in zip(ref, p[:len(ref)]) if np.isfinite(v)}
     band = {}
     for t in fut:
         t = int(t)
@@ -1358,10 +1562,23 @@ def make_forecast(live, extras, trained, tz, now, loc):
                 pi[t] = sum(vals) / len(vals)
         elif t not in pi and t in xs.get("temperature_2m", {}):
             pi[t] = xs["temperature_2m"][t]
+    for t in ref:
+        vals = [temps[k][int(t)] for k in order if int(t) in temps[k]]
+        if int(t) not in pi_ref and vals:
+            pi_ref[int(t)] = sum(vals) / len(vals)
+
+    # --- corrección con el sensor (si lo hay)
+    pi_raw = dict(pi)
+    adjust = correct(pi_ref) if correct and pi_ref else {}
+    if adjust:
+        pi = {t: v + adjust.get(t, 0.0) for t, v in pi.items()}
+        band = {t: (lo + adjust.get(t, 0.0), hi + adjust.get(t, 0.0)) for t, (lo, hi) in band.items()}
 
     # --- observado (análisis del modelo best match)
     obs_src = xs.get("temperature_2m") or (temps[order[0]] if order else {})
     obs = {t: v for t, v in obs_src.items() if now - 7 * 86400 <= t <= now}
+    if sensor_obs:                               # lo medido de verdad manda sobre el modelo
+        obs.update({t: v for t, v in sensor_obs.items() if now - 7 * 86400 <= t <= now})
 
     # --- climatología para la ventana mostrada
     window = sorted(set(obs) | set(pi))
@@ -1417,38 +1634,18 @@ def make_forecast(live, extras, trained, tz, now, loc):
         })
 
     # --- máxima y mínima con los modelos diarios propios (desde mañana)
-    if trained:
+    if trained and trained["leads"]:
         for dd in days:
-            ahead = (dd["date"] - today).days
-            if ahead < 1:
+            if (dd["date"] - today).days < 1:
                 continue
-            info = trained["leads"].get(max(1, min(7, ahead)))
-            if not info or not info.get("daily"):
-                continue
-            use = info["use"]
-            hrs = np.array([int(dd["t0"] + h * 3600) for h in range(24)], dtype=np.int64)
-            M = np.full((24, len(use)), np.nan)
-            for j, k in enumerate(use):
-                d = temps.get(k, {})
-                M[:, j] = [d.get(int(t), np.nan) for t in hrs]
-            ok = np.isfinite(M).sum(axis=1) >= max(1, (len(use) + 1) // 2)
-            if ok.sum() < 20:
-                continue
-            Mi = impute(M[ok])
-            d_, h_, _ = local_parts(hrs[ok], tz)
-            cv = trained["clim"][d_, h_]
-            parts = []
-            for kind in ("max", "min"):
-                mdl = info["daily"].get(kind)
-                if mdl is None:
-                    continue
-                F = (Mi.max(axis=0) if kind == "max" else Mi.min(axis=0))[None, :]
-                c = np.array([np.nanmax(cv) if kind == "max" else np.nanmin(cv)])
-                Xd = daily_features(F, c, np.array([d_[0]]))
-                if np.isfinite(Xd).all():
-                    dd[kind] = float(mdl.predict(Xd)[0])
-                    parts.append(f"{'máx' if kind == 'max' else 'mín'} {dd[kind]:.1f} °C "
-                                 f"(modelos {F.min():.1f}–{F.max():.1f}, normal {c[0]:.1f})")
+            hours = round((midnight(dd["date"] + timedelta(days=1), tz) - dd["t0"]) / 3600)
+            ext, parts = predict_daily(trained, temps, dd["t0"], now, tz, hours)
+            if adjust:                           # la corrección del sensor a la hora de la máx./mín.
+                day = [t for t in pi_raw if dd["t0"] <= t < dd["t0"] + hours * 3600]
+                for kind, pick in (("max", max), ("min", min)):
+                    if kind in ext and day:
+                        ext[kind] += adjust.get(pick(day, key=pi_raw.get), 0.0)
+            dd.update(ext)
             if parts:
                 log(f"  {DIAS[dd['date'].weekday()]} {dd['date'].day}: " + " · ".join(parts))
 
@@ -1487,45 +1684,63 @@ def make_forecast(live, extras, trained, tz, now, loc):
     cur["dew_point"] = xs.get("dew_point_2m", {}).get(
         max((t for t in xs.get("dew_point_2m", {}) if t <= now), default=-1))
 
+    if sensor_obs:
+        last = max(sensor_obs)
+        if now - last <= 2 * 3600:
+            cur["sensor_temp"] = sensor_obs[last]
     return {"now": now, "temps": {k: {t: v for t, v in temps[k].items() if t > now} for k in order},
-            "pi": pi, "band": band, "obs": obs, "clim": clim_line, "hours": hourly_rows,
+            "pi": pi, "pi_raw": pi_raw, "pi_ref": pi_ref, "corrected": bool(adjust), "band": band,
+            "sensor_obs": bool(sensor_obs), "obs": obs, "clim": clim_line, "hours": hourly_rows,
             "days": days, "current": cur, "models": order, "trained": bool(trained),
             "phases": next_phases(now, 40), "extras": bool(xs)}
 
 
-CORR_NAMES = ["Normal para la fecha", "Hora del día", "Hora del día", "Época del año", "Época del año",
-              "Ajuste día/noche", "Ajuste día/noche", "Desacuerdo entre modelos"]
+def _lead_terms(info, vals, t, tz, clim):
+    """Datos de entrada, pesos y constante del modelo de una antelación para la hora t."""
+    use, mdl = info["use"], info["model"]
+    M = np.array([[vals.get(k) if vals.get(k) is not None else np.nan for k in use]], dtype=float)
+    if np.isfinite(M).sum() < max(1, (len(use) + 1) // 2):
+        return None
+    doy, hour, _ = local_parts([t], tz)
+    X = features(impute(M), doy, hour, clim)[0]
+    const, b = mdl.raw()
+    return {"use": use, "X": X, "b": b, "const": const, "real": np.isfinite(M[0]),
+            "hour": int(hour[0]), "doy": int(doy[0])}
 
 
 def explain_hour(r, trained, tz, t):
     """Desglose exacto de la predicción del Pi para la hora t.
 
-    El ridge calcula  Pi = constante + Σ peso_i × dato_i ; aquí se devuelve cada término."""
+    El ridge calcula  Pi = constante + Σ peso_i × dato_i ; aquí se devuelve cada término.
+    Entre dos antelaciones (p. ej. a 30 h, entre 1 y 2 días) se mezclan pesos y constantes
+    en la misma proporción que en la predicción."""
     vals = {k: r["temps"].get(k, {}).get(t) for k in r["models"]}
     have = [v for v in vals.values() if v is not None]
     if not have:
         return None
-    if not trained:
+    if not trained or not trained["leads"]:
         n = len(have)
         return {"t": t, "lead": None, "const": 0.0, "corr": [], "total": sum(have) / n,
                 "sum_w": 1.0, "rows": [(SHORT.get(k, k), v, 1 / n, v / n, True)
                                        for k, v in vals.items() if v is not None]}
-    now = r["now"]
-    L = int(min(7, max(1, (t - now) // 86400 + 1)))
     leads = trained["leads"]
-    info = leads.get(L) or leads[min(leads, key=lambda k: abs(k - L))]
-    use, mdl = info["use"], info["model"]
-    M = np.array([[vals.get(k) if vals.get(k) is not None else np.nan for k in use]], dtype=float)
-    if np.isfinite(M).sum() < max(1, (len(use) + 1) // 2):
+    x = (t - r["now"]) / 86400.0
+    lo, hi, w = (v[0] for v in lead_mix([x], list(leads)))
+    lo, hi, w = int(lo), int(hi), float(w)
+    a = _lead_terms(leads[lo], vals, t, tz, trained["clim"])
+    b = _lead_terms(leads[hi], vals, t, tz, trained["clim"]) if hi != lo else a
+    if a is None and b is None:
         return None
-    Mi = impute(M)
-    doy, hour, _ = local_parts([t], tz)
-    X = features(Mi, doy, hour, trained["clim"])[0]
-    b = mdl.w[1:] / mdl.sd                                   # peso en °C por °C
-    const = float(mdl.w[0] - np.sum(mdl.w[1:] * mdl.mu / mdl.sd))
-    contrib = b * X
+    if a is None or b is None or a["use"] != b["use"]:   # no se pueden mezclar término a término
+        a, w = (b, 1.0) if a is None or (b is not None and w >= 0.5) else (a, 0.0)
+        b = a
+    use = a["use"]
+    X = (1 - w) * a["X"] + w * b["X"]
+    contrib = (1 - w) * a["b"] * a["X"] + w * b["b"] * b["X"]
+    bw = (1 - w) * a["b"] + w * b["b"]
+    const = (1 - w) * a["const"] + w * b["const"]
     n = len(use)
-    rows = [(SHORT.get(k, k), float(X[j]), float(b[j]), float(contrib[j]), bool(np.isfinite(M[0, j])))
+    rows = [(SHORT.get(k, k), float(X[j]), float(bw[j]), float(contrib[j]), bool(a["real"][j]))
             for j, k in enumerate(use)]
     groups = {}
     for i, name in enumerate(CORR_NAMES):
@@ -1533,9 +1748,14 @@ def explain_hour(r, trained, tz, t):
         g[0] += float(contrib[n + i])
         g[1].append(float(X[n + i]))
     corr = [(name, v, c) for name, (c, v) in groups.items()]
-    return {"t": t, "lead": L, "rows": rows, "corr": corr, "const": const,
-            "total": const + float(contrib.sum()), "sum_w": float(b[:n].sum()),
-            "hour": int(hour[0]), "doy": int(doy[0])}
+    total = const + float(contrib.sum())
+    sensor = None
+    if r.get("corrected") and t in r["pi"] and t in r.get("pi_raw", {}):
+        sensor = r["pi"][t] - r["pi_raw"][t]
+        total += sensor
+    return {"t": t, "lead": lo if w < 0.5 else hi, "lead_x": max(0.0, x), "rows": rows, "corr": corr,
+            "const": const, "total": total, "sum_w": float(bw[:n].sum()), "sensor": sensor,
+            "hour": a["hour"], "doy": a["doy"]}
 
 
 # ---------------------------------------------------------------- base de datos local
@@ -1547,6 +1767,7 @@ def db(loc):
     con.execute("CREATE TABLE IF NOT EXISTS tele(day TEXT PRIMARY KEY, tv_max REAL, tv_min REAL,"
                 " pi_max REAL, pi_min REAL, saved INTEGER)")
     con.execute("CREATE TABLE IF NOT EXISTS obs_day(day TEXT PRIMARY KEY, tmax REAL, tmin REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS sensor(ts INTEGER PRIMARY KEY, temp REAL, hum REAL)")
     return con
 
 
@@ -1610,6 +1831,10 @@ def tele_score(loc):
     s = {"n": 0, "pi": 0, "tv": 0, "tie": 0, "pending": pending, "rows": rows}
     if not rows:
         return s
+    rows = [r for r in rows if None not in r[1:]]
+    s["rows"] = rows
+    if not rows:
+        return s
     etv, epi = [], []
     for _, tvx, tvn, pix, pin, ox, on in rows:
         a = (abs(tvx - ox) + abs(tvn - on)) / 2
@@ -1624,6 +1849,587 @@ def tele_score(loc):
             s["tv"] += 1
     s.update(n=len(rows), err_tv=sum(etv) / len(etv), err_pi=sum(epi) / len(epi))
     return s
+
+
+# ================================================================ sensor DHT22 y modo sin conexión
+# El DHT22 se lee con el controlador del propio Linux (el mismo sirve para DHT11 y DHT22):
+#   añade «dtoverlay=dht11,gpiopin=4» a /boot/firmware/config.txt y reinicia.
+# Si no, con la librería de Adafruit (pip install adafruit-circuitpython-dht) y
+# "sensor": {"pin": 4} en ~/.clima_pi/config.json.
+IIO_BASE = "/sys/bus/iio/devices"
+SENSOR_EVERY_S = 300                     # una lectura cada 5 minutos
+SENSOR_RANGE = (-40.0, 80.0)             # lo que puede medir un DHT22
+SENSOR_HORIZONS = (1, 2, 3, 4, 6, 8, 10, 12, 15, 18, 21, 24, 30, 36, 42, 48, 60, 72, 96, 120, 144, 168)
+SENSOR_MIN_DAYS = 21                     # historial del sensor para entrenar su propio modelo
+_ADAFRUIT = {}
+
+
+def settings():
+    return _load_json(os.path.join(DATA_DIR, "config.json")) or {}
+
+
+def save_settings(**kw):
+    s = settings()
+    s.update(kw)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    _save_json(os.path.join(DATA_DIR, "config.json"), s, ensure_ascii=False, indent=1)
+
+
+def dht_device(base=None):
+    """Carpeta del DHT22 en /sys si el controlador del sistema está activo."""
+    base = base or IIO_BASE
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return None
+    for d in names:
+        try:
+            with open(os.path.join(base, d, "name")) as f:
+                if f.read().strip().startswith(("dht11", "dht22")):
+                    return os.path.join(base, d)
+        except OSError:
+            continue
+    return None
+
+
+def sensor_available():
+    cfg = settings().get("sensor") or {}
+    if cfg.get("enabled") is False:
+        return False
+    return bool(dht_device()) or cfg.get("pin") is not None
+
+
+def _read_once(dev, pin):
+    if dev:
+        with open(os.path.join(dev, "in_temp_input")) as f:
+            t = int(f.read()) / 1000.0
+        with open(os.path.join(dev, "in_humidityrelative_input")) as f:
+            h = int(f.read()) / 1000.0
+        return t, h
+    if pin not in _ADAFRUIT:
+        import adafruit_dht                  # solo si no hay controlador del sistema
+        import board
+        _ADAFRUIT[pin] = adafruit_dht.DHT22(getattr(board, f"D{pin}"), use_pulseio=False)
+    d = _ADAFRUIT[pin]
+    return d.temperature, d.humidity
+
+
+def read_sensor(tries=5, pause=2.2, sleep=time.sleep):
+    """(temperatura, humedad) del DHT22, o None.
+
+    El DHT22 falla a menudo (error de suma de control, tiempo agotado) y de vez en cuando da un
+    valor absurdo: se hacen hasta `tries` intentos (mínimo 2 s entre ellos, lo que pide el
+    sensor) y se devuelve la mediana de hasta 3 lecturas buenas."""
+    cfg = settings().get("sensor") or {}
+    if cfg.get("enabled") is False:
+        return None
+    dev, pin = dht_device(), cfg.get("pin")
+    if not dev and pin is None:
+        return None
+    good = []
+    for i in range(tries):
+        try:
+            t, h = _read_once(dev, pin)
+        except ImportError:
+            log("Falta la librería del DHT22: pip install adafruit-circuitpython-dht "
+                "(o activa dtoverlay=dht11,gpiopin=N)", "warn")
+            return None
+        except (OSError, ValueError, RuntimeError, TypeError, AttributeError):
+            t = h = None
+        if (t is not None and h is not None and SENSOR_RANGE[0] <= t <= SENSOR_RANGE[1]
+                and 0 <= h <= 100):
+            good.append((float(t), float(h)))
+            if len(good) == 3 or (len(good) == 2 and abs(good[0][0] - good[1][0]) < 0.3):
+                break
+        if i < tries - 1:
+            sleep(pause)
+    if not good:
+        return None
+    ts, hs = sorted(g[0] for g in good), sorted(g[1] for g in good)
+    mid = len(good) // 2
+    if len(good) == 2:
+        return (ts[0] + ts[1]) / 2, (hs[0] + hs[1]) / 2
+    return ts[mid], hs[mid]
+
+
+class SpikeFilter:
+    """Descarta saltos imposibles (p. ej. +6 °C en 5 min) salvo que la siguiente lectura los confirme."""
+
+    def __init__(self, max_jump=3.0, window=900):
+        self.max_jump, self.window = max_jump, window
+        self.last = None
+        self.held = None
+
+    def push(self, ts, t, h):
+        """Devuelve las lecturas aceptadas (0, 1 o 2)."""
+        if self.last is None or ts - self.last[0] > self.window or abs(t - self.last[1]) <= self.max_jump:
+            self.last, self.held = (ts, t, h), None
+            return [(ts, t, h)]
+        if self.held and abs(t - self.held[1]) <= 1.5:     # dos seguidas iguales: era de verdad
+            out = [self.held, (ts, t, h)]
+            self.last, self.held = (ts, t, h), None
+            return out
+        self.held = (ts, t, h)
+        return []
+
+
+def store_sensor(loc, rows):
+    con = db(loc)
+    try:
+        con.executemany("INSERT OR REPLACE INTO sensor VALUES (?,?,?)",
+                        [(int(ts), round(t, 2), round(h, 1)) for ts, t, h in rows])
+        con.commit()
+    finally:
+        con.close()
+
+
+def sensor_hourly(loc, since, until=None, min_samples=2):
+    """Medias horarias del sensor ({hora: temp}, {hora: humedad}), centradas en cada hora."""
+    until = until if until is not None else time.time() + 3600
+    con = db(loc)
+    try:
+        rows = con.execute("SELECT ((ts + 1800) / 3600) * 3600 AS hh, AVG(temp), AVG(hum), COUNT(*) "
+                           "FROM sensor WHERE ts >= ? AND ts < ? GROUP BY hh HAVING COUNT(*) >= ?",
+                           (int(since) - 1800, int(until) + 1800, min_samples)).fetchall()
+    finally:
+        con.close()
+    rows = [r for r in rows if r[0] <= until]          # una hora que aún no ha llegado va a medias
+    return {int(r[0]): float(r[1]) for r in rows}, {int(r[0]): float(r[2]) for r in rows}
+
+
+def sensor_latest(loc, max_age=1800, now=None):
+    now = time.time() if now is None else now
+    con = db(loc)
+    try:
+        r = con.execute("SELECT ts, temp, hum FROM sensor WHERE ts <= ? ORDER BY ts DESC LIMIT 1",
+                        (int(now),)).fetchone()
+    finally:
+        con.close()
+    return r if r and now - r[0] <= max_age else None
+
+
+def dew_point(t, rh):
+    """Punto de rocío (fórmula de Magnus)."""
+    t, rh = np.asarray(t, dtype=float), np.clip(np.asarray(rh, dtype=float), 1, 100)
+    g = np.log(rh / 100) + 17.62 * t / (243.12 + t)
+    return 243.12 * g / (17.62 - g)
+
+
+def apparent(t, rh):
+    """Sensación térmica a la sombra y sin viento (Steadman, la que usa la oficina australiana)."""
+    t, rh = np.asarray(t, dtype=float), np.asarray(rh, dtype=float)
+    e = rh / 100 * 6.105 * np.exp(17.27 * t / (237.7 + t))
+    return t + 0.33 * e - 4.0
+
+
+# ---------------------------------------------------------------- modelo propio del sensor
+def _grid(d, t0, n):
+    a = np.full(n, np.nan)
+    for t, v in d.items():
+        i = (int(t) - t0) // 3600
+        if 0 <= i < n:
+            a[i] = v
+    return a
+
+
+def _shift(a, k):
+    """a desplazado k posiciones (a[i - k]), NaN fuera de rango."""
+    out = np.full(len(a), np.nan)
+    if k >= 0:
+        out[k:] = a[:len(a) - k] if k else a
+    else:
+        out[:k] = a[-k:]
+    return out
+
+
+def _recent(S, h, days=7, need=3):
+    """Para cada hora i: media de los últimos `days` días a la misma hora del reloj que i+h
+    (solo con lo ya medido en i)."""
+    m = (-h) % 24
+    st = np.vstack([_shift(S, m + 24 * k) for k in range(days)])
+    cnt = np.isfinite(st).sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.where(np.isfinite(st), st, 0).sum(axis=0) / np.maximum(cnt, 1)
+    return np.where(cnt >= need, mean, np.nan)
+
+
+SITING_DAYS = 30                       # días recientes para ajustar la normal a tu sitio
+
+
+def sensor_frame(S, Hm, t0, h, tz, clim=None):
+    """Para cada hora i del historial y una antelación h: (variables, base, anomalía de ahora).
+
+    base = lo esperable a la hora i+h: la misma hora en los últimos 7 días, que con los días
+    va dando paso a la normal de la fecha (ERA5) ajustada a tu sitio con lo medido en los últimos
+    30 días a esa hora. El modelo solo predice cuánto se separará la temperatura de esa base
+    (la «anomalía»), que cambia despacio."""
+    n = len(S)
+    R, R0 = _recent(S, h), _recent(S, 0)
+    a0 = S - R0
+    idx = np.arange(n, dtype=np.int64)
+    tgt = t0 + 3600 * (idx + h)
+    doy, hour_t, _ = local_parts(tgt, tz)
+    doy_i, hour_i, _ = local_parts(t0 + 3600 * idx, tz)
+    base = R
+    cols_extra = []
+    if clim is not None:
+        sit = _recent(S - clim[doy_i, hour_i], h, days=SITING_DAYS, need=10)
+        N = clim[doy, hour_t] + sit
+        w = math.exp(-h / 72)
+        base = np.where(np.isfinite(N), w * R + (1 - w) * N, R)
+        cols_extra = [np.where(np.isfinite(N), R - N, 0.0)]
+    Td = dew_point(S, Hm)
+    a, b = 2 * np.pi * hour_t / 24.0, 2 * np.pi * hour_i / 24.0
+    X = np.column_stack([a0, S - _shift(S, 1), S - _shift(S, 3), S - _shift(S, 24), Hm, Td,
+                         Td - _shift(Td, 3), Td - _shift(Td, 24), np.sin(a), np.cos(a), np.sin(b),
+                         np.cos(b)] + cols_extra)
+    return X, base, a0
+
+
+DAMP_H = 12.0                          # la anomalía de ahora se reduce a un tercio en 12 h
+
+
+def _fallback_mae(h):
+    """Error típico de la persistencia amortiguada (sin modelo entrenado)."""
+    return min(3.2, 0.35 + 0.55 * math.sqrt(h))
+
+
+def train_sensor(temp, hum, tz, clim=None):
+    """Entrena, para cada antelación (1 h … 7 días), un modelo solo con el historial del sensor.
+
+    Prueba justa como el Modelo Pi: aprende con el 80 % más antiguo y se mide en el resto. En
+    cada antelación se queda con el modelo o con la persistencia amortiguada, el que falle menos."""
+    if not temp:
+        return None
+    t0 = min(temp)
+    n = (max(temp) - t0) // 3600 + 1
+    S, Hm = _grid(temp, t0, n), _grid(hum, t0, n)
+    if np.isfinite(S).sum() < 24 * SENSOR_MIN_DAYS:
+        return None
+    cl = clim if clim is not None and np.isfinite(clim).all() else None
+    cut = int(n * 0.8)
+    out = {"t0": int(t0), "hours": int(np.isfinite(S).sum()), "clim": cl is not None, "h": {},
+           "trained_at": time.time()}
+    idx = np.arange(n)
+    for h in SENSOR_HORIZONS:
+        X, base, a0 = sensor_frame(S, Hm, t0, h, tz, cl)
+        y = _shift(S, -h) - base
+        ok = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        tr, te = ok & (idx + h < cut), ok & (idx >= cut)
+        if tr.sum() < 24 * 10 or te.sum() < 48:
+            continue
+        m = Ridge().fit(X[tr], y[tr], lam=20.0)
+        res_m = m.predict(X[te]) - y[te]
+        res_d = a0[te] * math.exp(-h / DAMP_H) - y[te]
+        mae_m, mae_d = float(np.mean(np.abs(res_m))), float(np.mean(np.abs(res_d)))
+        use_model = mae_m < mae_d
+        res = res_m if use_model else res_d
+        # con pocos días de prueba el error medido es poco fiable: se acerca a uno prudente
+        days = te.sum() / 24
+        mae = (days * min(mae_m, mae_d) + 20 * _fallback_mae(h)) / (days + 20)
+        out["h"][h] = {"model": Ridge().fit(X[ok], y[ok], lam=20.0) if use_model else None,
+                       "mae": mae, "mae_model": mae_m, "mae_damped": mae_d,
+                       "mae_persist": float(np.mean(np.abs(S[idx[te]] - (y[te] + base[te])))),
+                       "q10": float(np.percentile(res, 10)), "q90": float(np.percentile(res, 90)),
+                       "n": int(ok.sum()), "n_test": int(te.sum())}
+    if not out["h"]:
+        return None
+    msg = " · ".join(f"{h} h {i['mae']:.2f} (persistencia {i['mae_persist']:.2f})"
+                     for h, i in out["h"].items() if h in (1, 6, 24, 72))
+    log(f"MODELO DEL SENSOR: {out['hours']:,} horas medidas · error en prueba: {msg}", "train")
+    return out
+
+
+def save_sensor_model(loc, sm):
+    data = dict(sm, h={str(h): dict(i, model=i["model"].to_dict() if i["model"] else None)
+                       for h, i in sm["h"].items()})
+    _save_json(os.path.join(loc_dir(loc), "modelo_sensor.json"), data)
+
+
+def load_sensor_model(loc):
+    d = _load_json(os.path.join(loc_dir(loc), "modelo_sensor.json"))
+    try:
+        d["h"] = {int(h): dict(i, model=Ridge.from_dict(i["model"]) if i["model"] else None)
+                  for h, i in d["h"].items()}
+        return d
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def sensor_forecast(sm, temp, hum, tz, now, clim=None, hours=168):
+    """Pronóstico solo con el sensor: {hora: (temp, error típico)} para las próximas `hours` h.
+
+    temperatura = base de esa hora (ciclo día/noche de los últimos días → normal de la fecha)
+                + anomalía prevista (modelo entrenado, o la de ahora que se va olvidando)."""
+    if not temp:
+        return {}
+    last = max(temp)
+    if now - last > 2 * 3600:
+        return {}
+    t0 = last - 24 * 3600 * (SITING_DAYS + 9)
+    n = (last - t0) // 3600 + 1
+    S, Hm = _grid(temp, t0, n), _grid(hum, t0, n)
+    if not np.isfinite(S[-1]):
+        return {}
+    trained = bool(sm and sm.get("h")) and bool(sm.get("clim")) == (clim is not None)
+    cl = clim if trained and sm.get("clim") or not trained else None
+    hs = sorted(sm["h"]) if trained else list(SENSOR_HORIZONS)
+    anom, err = {}, {}
+    a_now = None
+    for h in hs:
+        X, base, a0 = sensor_frame(S, Hm, t0, h, tz, cl)
+        a_now = a0[-1]
+        info = sm["h"][h] if trained else None
+        if info and info["model"] is not None and np.isfinite(X[-1]).all():
+            anom[h] = float(info["model"].predict(X[-1:])[0])
+        elif np.isfinite(a0[-1]):
+            anom[h] = float(a0[-1]) * math.exp(-h / DAMP_H)
+        err[h] = info["mae"] if info else _fallback_mae(h)
+    if a_now is None or not np.isfinite(a_now) or not anom:
+        # menos de 3 días medidos: lo de ahora, acercándose poco a poco a la normal si la hay
+        out = {}
+        for h in range(1, hours + 1):
+            t = int(last + 3600 * h)
+            if t > now:
+                out[t] = (float(S[-1]), _fallback_mae(h) * 1.3)
+        return out
+    hx = np.array([0] + sorted(anom))
+    ax = np.array([a_now] + [anom[h] for h in sorted(anom)])
+    ex = np.array([0.3] + [err[h] for h in sorted(anom)])
+    out = {}
+    for h in range(1, hours + 1):
+        t = int(last + 3600 * h)
+        if t <= now:
+            continue
+        _, base, _ = sensor_frame(S, Hm, t0, h, tz, cl)
+        if not np.isfinite(base[-1]):
+            continue
+        out[t] = (float(base[-1] + np.interp(h, hx, ax)), float(np.interp(h, hx, ex)))
+    return out
+
+
+# ---------------------------------------------------------------- el sensor corrige el pronóstico
+def sensor_bias(loc, tz, now, days=14):
+    """Diferencia típica, por hora del día, entre el sensor y lo que predijo el Pi a menos de 24 h.
+
+    Es la diferencia entre «la casilla de 9 km del modelo» y tu sitio: sombra, ciudad, ladera…
+    Devuelve (24 sesgos en °C, error típico que queda, nº de horas comparadas) o None."""
+    temp, _ = sensor_hourly(loc, now - days * 86400, now)
+    if len(temp) < 72:
+        return None
+    con = db(loc)
+    try:
+        rows = con.execute(
+            "SELECT p.valid, p.temp FROM pred p WHERE p.valid BETWEEN ? AND ? AND p.issue = "
+            "(SELECT MAX(q.issue) FROM pred q WHERE q.valid = p.valid AND q.issue < p.valid)",
+            (int(now - days * 86400), int(now))).fetchall()
+    finally:
+        con.close()
+    pairs = [(int(v), temp[int(v)] - f) for v, f in rows if int(v) in temp]
+    if len(pairs) < 72:
+        return None
+    _, hour, _ = local_parts([p[0] for p in pairs], tz)
+    diff = np.array([p[1] for p in pairs])
+    overall = float(np.median(diff))
+    b = np.array([float(np.median(diff[hour == h])) if (hour == h).sum() >= 4 else overall
+                  for h in range(24)])
+    b = (np.roll(b, 1) + 2 * b + np.roll(b, -1)) / 4                 # suavizar entre horas vecinas
+    resid = diff - b[hour]
+    return b, float(np.mean(np.abs(resid))), len(pairs)
+
+
+def sensor_adjust(bias, tz, now, now_err, times, tau=8.0):
+    """Corrección para cada hora: sesgo de esa hora + el error de ahora, que se va olvidando."""
+    if not len(times):
+        return {}
+    _, hour, _ = local_parts(times, tz)
+    out = {}
+    for t, hh in zip(times, hour):
+        c = (bias[hh] if bias is not None else 0.0) + now_err * math.exp(-(t - now) / 3600 / tau)
+        out[int(t)] = float(c)
+    return out
+
+
+def sensor_correction(loc, tz, now):
+    """Para el pronóstico con red: función que, con lo que predijo el Pi para las últimas horas,
+    devuelve cuánto corregir cada hora futura para que acierte en tu sitio. None si no hay sensor."""
+    temp, _ = sensor_hourly(loc, now - 3 * 3600, now)
+    if not temp:
+        return None
+    last = max(temp)
+    bias = sensor_bias(loc, tz, now)
+    b = bias[0] if bias else None
+
+    def correct(ref):
+        r = ref.get(last)
+        if r is None:
+            return {}
+        hb = local_parts([last], tz)[1][0]
+        err = temp[last] - (r + (b[hb] if b is not None else 0.0))
+        log(f"SENSOR: mide {temp[last]:.1f} °C; el Pi decía {r:.1f}"
+            + (f" y aquí suele haber {b[hb]:+.1f} °C de diferencia a esta hora" if b is not None else "")
+            + f" → corrijo {err:+.1f} °C ahora, olvidándolo poco a poco")
+        times = np.arange(last + 3600, now + 8 * 86400, 3600, dtype=np.int64)
+        return sensor_adjust(b, tz, last, err, times)
+    return correct
+
+
+def stale_forecast(loc, now):
+    """El último pronóstico del Pi guardado antes de quedarse sin red: (emitido, {hora: temp})."""
+    con = db(loc)
+    try:
+        r = con.execute("SELECT MAX(issue) FROM pred WHERE issue <= ? AND valid > ?",
+                        (int(now), int(now))).fetchone()
+        if not r or r[0] is None:
+            return None, {}
+        rows = con.execute("SELECT valid, temp FROM pred WHERE issue = ?", (r[0],)).fetchall()
+    finally:
+        con.close()
+    return int(r[0]), {int(v): float(x) for v, x in rows}
+
+
+GENERIC_LEAD_MAE = [0.9, 1.1, 1.3, 1.6, 1.9, 2.2, 2.5, 2.8]   # error típico del Pi por día de antelación
+ERR_CORR = 0.5          # los errores del sensor y del pronóstico guardado se parecen (mismo tiempo)
+
+
+def _combine(parts, rho=ERR_CORR):
+    """Media ponderada óptima de 1 o 2 estimaciones (valor, error típico) con errores correlados.
+
+    Devuelve (valor, error típico del resultado). Con ρ = 0 sería la media por inversa de la
+    varianza; con ρ > 0 se confía menos en juntar dos fuentes que fallan a la vez."""
+    if len(parts) == 1:
+        return float(parts[0][0]), float(parts[0][1])
+    (a, sa, _), (b, sb, _) = parts[:2]
+    c = rho * sa * sb
+    den = sa * sa + sb * sb - 2 * c
+    wa = min(1.0, max(0.0, (sb * sb - c) / den)) if den > 1e-12 else 0.5
+    wb = 1 - wa
+    var = wa * wa * sa * sa + wb * wb * sb * sb + 2 * wa * wb * c
+    return float(wa * a + wb * b), float(math.sqrt(max(var, 1e-6)))
+
+
+def stale_skill(loc, tz, now, bias, days=30):
+    """Error real (medido con tu sensor) de los pronósticos guardados, corregidos con el sesgo de
+    tu sitio, según los días que llevaban emitidos: [error a 0 días, 1 día, … 7 días] o None."""
+    temp, _ = sensor_hourly(loc, now - days * 86400, now)
+    if len(temp) < 24 * 5:
+        return None
+    con = db(loc)
+    try:
+        rows = con.execute("SELECT issue, valid, temp FROM pred WHERE valid BETWEEN ? AND ?",
+                           (int(now - days * 86400), int(now))).fetchall()
+    finally:
+        con.close()
+    rows = [r for r in rows if int(r[1]) in temp]
+    if len(rows) < 200:
+        return None
+    issue, valid, f = (np.array(c) for c in zip(*rows))
+    hour = local_parts(valid, tz)[1]
+    corr = f + (bias[hour] if bias is not None else 0.0)
+    err = np.abs(corr - np.array([temp[int(v)] for v in valid]))
+    lead = np.minimum(7, (valid - issue) // 86400)
+    out = []
+    for L in range(8):
+        m = lead == L
+        # (error medio, nº de días distintos medidos: los errores de horas seguidas se parecen)
+        out.append((float(err[m].mean()), len(np.unique(valid[m] // 86400))) if m.sum() >= 48 else None)
+    return out if sum(x is not None for x in out) >= 2 else None
+
+
+def offline_forecast(loc, tz, now, trained=None, sm=None):
+    """Pronóstico completamente sin conexión.
+
+    Junta dos fuentes, cada una pesada según su error esperado (la que suele fallar menos pesa más):
+      1. el modelo del sensor (lo que se puede saber solo con lo medido aquí);
+      2. el último pronóstico descargado, si lo hay, corregido con el sensor; su error crece
+         con los días que lleva sin actualizarse.
+    Devuelve un resultado como el de make_forecast(), o lanza RuntimeError si no hay con qué."""
+    clim = trained["clim"] if trained else None
+    temp, hum = sensor_hourly(loc, now - (SITING_DAYS + 10) * 86400, now)
+    local = sensor_forecast(sm, temp, hum, tz, now, clim)
+    issue, stale = stale_forecast(loc, now)
+    if not local and not stale:
+        raise RuntimeError("sin conexión y sin datos del sensor ni pronósticos guardados")
+    bias = sensor_bias(loc, tz, now) if temp else None
+    b = bias[0] if bias else None
+    rep = bias[1] if bias else 0.6
+    now_err = 0.0
+    if stale and temp:
+        last = max(temp)
+        f_last = stale.get(last)
+        if f_last is None:                                   # la hora medida ya era «pasado» al emitir
+            prev = [t for t in stale if t <= last]
+            f_last = stale[max(prev)] if prev else None
+        if f_last is not None:
+            hb = local_parts([last], tz)[1][0]
+            now_err = temp[last] - (f_last + (b[hb] if b is not None else 0.0))
+    skill = stale_skill(loc, tz, now, b) if stale and temp else None
+    fut = sorted(set(local) | {t for t in stale if now < t <= now + 7 * 86400})
+    adj = sensor_adjust(b, tz, now, now_err, np.array([t for t in fut if t in stale], dtype=np.int64)) \
+        if temp and stale else {}
+    pi, band, src = {}, {}, {"sensor": 0, "guardado": 0}
+    for t in fut:
+        parts = []
+        if t in local:
+            v, e = local[t]
+            parts.append((v, 1.25 * e, "sensor"))
+        if t in stale:
+            lead = (t - issue) / 86400.0
+            base = None                                         # lo esperable: error del Pi + tu sitio
+            if trained and trained["leads"]:
+                ls = sorted(trained["leads"])
+                base = float(np.interp(lead, ls, [trained["leads"][L]["mae"].get("pi", np.nan) for L in ls]))
+            if base is None or not math.isfinite(base):
+                base = float(np.interp(lead, range(8), GENERIC_LEAD_MAE))
+            mae = 1.3 * math.hypot(base, rep if temp else 0)
+            if skill:                                           # medido con tu sensor: cuenta según
+                ls = [L for L, e in enumerate(skill) if e]      # cuántos días se pudo medir
+                meas = float(np.interp(lead, ls, [skill[L][0] for L in ls]))
+                days = float(np.interp(lead, ls, [skill[L][1] for L in ls]))
+                mae = max(base, (days * meas + 15 * mae) / (days + 15))
+            if lead > 7:
+                mae *= 1 + (lead - 7) / 2                       # más allá de lo que se pronosticó
+            parts.append((stale[t] + adj.get(t, 0.0), 1.25 * mae, "guardado"))
+        v, sd = _combine(parts)
+        pi[t] = v
+        band[t] = (v - 1.28 * sd, v + 1.28 * sd)          # 8 de cada 10 veces dentro (aprox.)
+        src[max(parts, key=lambda p: 1 / p[1])[2]] += 1
+
+    # respuesta con el formato de Open-Meteo para aprovechar make_forecast (tablas, días, Sol y Luna)
+    past = sorted(t for t in temp if now - 7 * 86400 <= t <= now)
+    ts = past + [t for t in sorted(pi) if t > now]
+    tv = [temp[t] for t in past] + [pi[t] for t in ts[len(past):]]
+    hv = [hum.get(t) for t in past] + [None] * (len(ts) - len(past))
+    hh = np.array([np.nan if x is None else x for x in hv], dtype=float)
+    ta = np.array(tv, dtype=float)
+    with np.errstate(invalid="ignore"):
+        dp, ap = dew_point(ta, hh), apparent(ta, hh)
+
+    def nn(a):
+        return [None if not np.isfinite(x) else round(float(x), 2) for x in a]
+    extras = {"hourly": {"time": ts, "temperature_2m": nn(ta), "relative_humidity_2m": nn(hh),
+                         "dew_point_2m": nn(dp), "apparent_temperature": [
+                             a if a is not None else t for a, t in zip(nn(ap), nn(ta))]}}
+    cur = sensor_latest(loc, now=now)
+    if cur:
+        extras["current"] = {"time": int(cur[0]), "temperature_2m": cur[1], "relative_humidity_2m": cur[2],
+                             "apparent_temperature": float(apparent(cur[1], cur[2]))}
+    r = make_forecast({}, extras, trained, tz, now, loc)
+    r["band"] = {t: band[t] for t in band if t in r["pi"]}
+    for rows in r["hours"].values():
+        for row in rows:
+            row["band"] = r["band"].get(row["t"])
+    r["offline"] = True
+    r["sensor_obs"] = bool(past)
+    r["sources"] = src
+    r["stale_issue"] = issue
+    r["band_label"] = "Margen probable (8 de cada 10)"
+    if cur:
+        r["current"]["desc"] = "Sin conexión · medido por tu sensor"
+    log(f"SIN CONEXIÓN: {len(pi)} horas pronosticadas · {src['sensor']} h manda el sensor, "
+        f"{src['guardado']} h el último pronóstico descargado"
+        + (f" ({datetime.fromtimestamp(issue, tz):%d/%m %H:%M})" if issue else ""))
+    return r
 
 
 def climate_history(resp):
@@ -1946,6 +2752,12 @@ def to_pts(d, t0, t1, gap=3 * 3600):
     return pts
 
 
+def pi_label(r):
+    if r.get("offline"):
+        return "Pronóstico sin conexión"
+    return "Modelo Pi + tu sensor" if r.get("corrected") else "Modelo Pi"
+
+
 def fmt(v, f="{:.0f}", suffix=""):
     return "—" if v is None else f.format(v) + suffix
 
@@ -2004,6 +2816,7 @@ class App:
         self._poll()
         self._scheduler()
         self._live_tick()
+        threading.Thread(target=self._sensor_loop, daemon=True).start()
         loc = load_config()
         if loc:
             self.set_location(loc)
@@ -2091,8 +2904,9 @@ class App:
             return {"max": d["max"], "min": d["min"], "code": d["code"], "desc": wmo(d["code"]),
                     "rain_p": d["rain_p"], "rain": d["rain"], "h9": d["h9"], "h15": d["h15"],
                     "h21": d["h21"]}
-        state = {"loc": self.loc.get("name"), "temp": c.get("temperature_2m"),
-                 "desc": wmo(c.get("weather_code")), "today": day(days[0] if days else None),
+        t = c.get("temperature_2m") if r.get("offline") else c.get("sensor_temp", c.get("temperature_2m"))
+        state = {"loc": self.loc.get("name"), "temp": t,
+                 "desc": c.get("desc") or wmo(c.get("weather_code")), "today": day(days[0] if days else None),
                  "tomorrow": day(days[1] if len(days) > 1 else None),
                  "sunrise": hhmm(days[0]["sunrise"], tz) if days else "—",
                  "sunset": hhmm(days[0]["sunset"], tz) if days else "—",
@@ -2101,7 +2915,6 @@ class App:
             _save_json(state_path(), state)
         except OSError:
             pass
-        t = c.get("temperature_2m")
         self.root.title(f"Clima Pi · {self.loc.get('name', '')} {fmt(t, '{:.0f}', ' °C')}")
 
     # ---------- estilo y construcción
@@ -2203,6 +3016,8 @@ class App:
         self.now_desc.pack(anchor="w", padx=14)
         self.now_feel = self._lbl(left, "", fg=MUTED, size=10)
         self.now_feel.pack(anchor="w", padx=14, pady=(0, 6))
+        self.sensor_lbl = self._lbl(left, "", fg=PI_C, size=10)    # vacío si no hay sensor
+        self.sensor_lbl.pack(anchor="w", padx=14)
         grid = tk.Frame(left, bg=PANEL)
         grid.pack(fill="x", padx=10, pady=(0, 10))
         self.now_tiles = {}
@@ -2317,7 +3132,8 @@ class App:
         nb.add(f, text="Precisión")
         self.acc_chart = Chart(f, 260)
         self.acc_chart.c.pack(fill="both", expand=True, pady=(8, 6))
-        cols = [("pos", "#", 30), ("modelo", "Modelo", 190), ("d1", "1 día", 70), ("d3", "3 días", 70),
+        cols = [("pos", "#", 30), ("modelo", "Modelo", 190), ("d0", "Hoy", 60), ("d1", "1 día", 70),
+                ("d3", "3 días", 70),
                 ("d5", "5 días", 70), ("d7", "7 días", 70), ("mx", "Máx. de mañana", 110),
                 ("mn", "Mín. de mañana", 110)]
         frame, self.rank_tree = self._tree(f, cols, 9)
@@ -2441,6 +3257,14 @@ class App:
         self.log_text.config(state="disabled")
 
     def _live_tick(self):
+        try:
+            self._live_tick_body()
+        except Exception as e:
+            log(f"ERROR en la pestaña En vivo: {e!r}", "err")
+        finally:
+            self.root.after(1000, self._live_tick)
+
+    def _live_tick_body(self):
         T = self.live_tiles
         now, cpu = time.time(), time.process_time()
         pw, pc = self._cpu_prev
@@ -2486,7 +3310,6 @@ class App:
             log(f"El icono de la barra se cerró (código {self.tray_proc.returncode}). {tail}", "warn")
             if self.root.state() == "withdrawn":
                 self.show_window()                 # sin icono no habría forma de volver a abrirla
-        self.root.after(1000, self._live_tick)
 
     # ---------- desglose de una predicción
     def show_explain(self):
@@ -2524,8 +3347,11 @@ class App:
             else:
                 dato = "media × hora"
             tv.insert("", "end", tags=["corr"], values=(name, dato, "", f"{c:+.2f} °C"))
-        if e["lead"]:
+        if e["lead"] is not None:
             tv.insert("", "end", tags=["corr"], values=("Constante aprendida", "", "", f"{e['const']:+.2f} °C"))
+        if e.get("sensor") is not None:
+            tv.insert("", "end", tags=["corr"], values=("Corrección con tu sensor", "", "",
+                                                        f"{e['sensor']:+.2f} °C"))
         tv.insert("", "end", tags=["sum"], values=("TOTAL = Modelo Pi", "", "", f"{e['total']:.2f} °C"))
         cons = [x for _, x, _, _, real in e["rows"] if real]
         txt = f"Modelo Pi = {e['total']:.1f} °C"
@@ -2533,7 +3359,7 @@ class App:
             txt += f"   ·   media simple de los modelos {sum(cons) / len(cons):.1f} °C"
         self.explain_total.config(text=txt)
 
-        if not e["lead"]:
+        if e["lead"] is None:
             self.weights_chart.message("El Modelo Pi aún no está entrenado:\n"
                                        "de momento todos los modelos pesan lo mismo.")
             self.weights_note.config(text="")
@@ -2543,7 +3369,7 @@ class App:
             mae = info["mae"]
             self.weights_chart.show({
                 "kind": "bars", "unit": "", "groups": [n for n, *_ in e["rows"]], "rotate": True,
-                "title": f"Peso de cada modelo a {e['lead']} día(s) vista",
+                "title": f"Peso de cada modelo a {e['lead_x'] * 24:.0f} h vista",
                 "series": [{"label": "Peso aprendido", "color": PI_C, "values": [w for _, _, w, _, _ in e["rows"]]}]})
             best = min((k for k in mae if k in NAMES and k != "app"), key=mae.get, default=None)
             self.weights_note.config(text=(
@@ -2653,9 +3479,14 @@ class App:
         log(f"══ ACTUALIZACIÓN {'con reentrenamiento ' if retrain else ''}· {loc_name(loc)} "
             f"({datetime.now(get_tz(loc)):%d/%m %H:%M})", "head")
         try:
-            if not online():
-                raise RuntimeError("sin conexión a internet")
             tz = get_tz(loc)
+            sensor = sensor_available()
+            forced = OFFLINE_FORCED or bool(settings().get("offline"))
+            if forced or not online():
+                self._offline_job(loc, key, tz, trained, sensor, forced, retrain)
+                log(f"══ Actualización terminada en {time.perf_counter() - t_job:.1f} s", "head")
+                q.put(("done", None, key))
+                return
             if retrain:
                 try:
                     q.put(("status", "Descargando historial ERA5 por horas…", key))
@@ -2701,9 +3532,19 @@ class App:
             if not live and not extras:
                 raise RuntimeError("no se pudo descargar ningún pronóstico")
             now = time.time()
-            res = make_forecast(live, extras, trained, tz, now, loc)
+            correct = s_obs = None
+            if sensor:
+                try:
+                    correct = sensor_correction(loc, tz, now)
+                    s_obs = sensor_hourly(loc, now - 7 * 86400, now)[0]
+                    if retrain or not load_sensor_model(loc):
+                        self._train_sensor(loc, tz, trained)
+                except (sqlite3.Error, OSError) as e:
+                    q.put(("warn", f"sensor: {e}", key))
+            res = make_forecast(live, extras, trained, tz, now, loc, correct, s_obs)
             try:
-                res["pi_past"] = log_predictions(loc, now, res["pi"])
+                # se guarda lo que predijo el Pi sin la corrección del sensor (con eso se calcula)
+                res["pi_past"] = log_predictions(loc, now, res["pi_raw"])
                 store_observed_days(loc, res["obs"], tz, now)
                 res["tele"] = tele_score(loc)
             except Exception:
@@ -2728,23 +3569,95 @@ class App:
         finally:
             q.put(("idle", None, key))
 
+    def _train_sensor(self, loc, tz, trained):
+        temp, hum = sensor_hourly(loc, 0, time.time())
+        sm = train_sensor(temp, hum, tz, trained["clim"] if trained else None)
+        if sm:
+            save_sensor_model(loc, sm)
+        else:
+            days = len(temp) / 24
+            log(f"Sensor: {days:.0f} de {SENSOR_MIN_DAYS} días medidos para entrenar su propio modelo; "
+                "mientras tanto uso «persistencia amortiguada»")
+        return sm
+
+    def _offline_job(self, loc, key, tz, trained, sensor, forced, retrain):
+        """Sin internet (o modo sin conexión elegido): sensor + último pronóstico descargado."""
+        q = self.q
+        q.put(("status", "Sin conexión: pronóstico con " + ("tu sensor y " if sensor else "")
+               + "lo último que se descargó…", key))
+        log("Modo sin conexión" + (" (elegido por ti)" if forced else ": no hay internet"), "warn")
+        sm = None
+        if sensor:
+            sm = load_sensor_model(loc)
+            if not sm or time.time() - sm.get("trained_at", 0) > RETRAIN_EVERY_S:
+                sm = self._train_sensor(loc, tz, trained) or sm
+        now = time.time()
+        res = offline_forecast(loc, tz, now, trained, sm)
+        res["pi_past"] = {}                 # lo de sin conexión no se guarda como pronóstico del Pi
+        try:
+            store_observed_days(loc, res["obs"], tz, now)
+            res["tele"] = tele_score(loc)
+        except sqlite3.Error:
+            pass
+        res["forced"] = forced
+        q.put(("forecast", res, key))
+        if retrain:
+            q.put(("retrain_later", None, key))
+
+    def _sensor_loop(self):
+        """Lee el DHT22 cada 5 minutos. Si no hay sensor no hace nada (lo vuelve a mirar cada
+        5 minutos, por si se conecta después)."""
+        filt, fails, said = SpikeFilter(), 0, False
+        while True:
+            try:
+                loc = self.loc
+                if loc and sensor_available():
+                    if not said:
+                        log("Sensor DHT22 encontrado: lo leo cada 5 minutos")
+                        said = True
+                    r = read_sensor()
+                    if r:
+                        fails = 0
+                        rows = filt.push(time.time(), *r)
+                        if rows:
+                            store_sensor(loc, rows)
+                            self.q.put(("sensor", rows[-1], None))
+                    else:
+                        fails += 1
+                        if fails in (3, 36):        # 15 min y 3 h sin lecturas
+                            log("El DHT22 no responde (¿cable, alimentación, resistencia de 10 kΩ?)", "warn")
+            except Exception as e:                  # el sensor nunca debe parar el programa
+                log(f"Sensor: {e}", "warn")
+            time.sleep(SENSOR_EVERY_S)
+
     def _poll(self):
         try:
             while True:
                 kind, data, key = self.q.get_nowait()
-                self._handle(kind, data, key)
+                try:
+                    self._handle(kind, data, key)
+                except Exception as e:              # un fallo al pintar no debe parar la ventana
+                    log(f"ERROR al mostrar «{kind}»: {e!r}", "err")
+                    traceback.print_exc()
         except queue.Empty:
             pass
-        self._drain_log()
-        self.root.after(200, self._poll)
+        finally:
+            try:
+                self._drain_log()
+            finally:
+                self.root.after(200, self._poll)
 
     def _handle(self, kind, data, key):
         if kind == "cmd":
+            if key is not None and data != "quit":
+                key.set()                       # la ventana responde: no está colgada
             if data == "show":
                 self.show_window()
             elif data == "update":
                 self.request_update(retrain=False)
             elif data == "quit":
+                if key is not None:
+                    key.set()
                 self.quit_app()
             return
         if kind == "geo":
@@ -2778,10 +3691,24 @@ class App:
             self.show_history(data)
         elif kind == "history_err":
             self.hist_chart.message(f"No se pudo descargar el historial: {data}")
+        elif kind == "retrain_later":           # sin red no se puede reentrenar: probar luego
+            self.trained_at = time.time() - RETRAIN_EVERY_S + 900
+        elif kind == "sensor":
+            ts, t, h = data
+            self.sensor_lbl.config(text=f"Tu sensor: {t:.1f} °C · {h:.0f} % de humedad "
+                                        f"({datetime.fromtimestamp(ts, self.tz):%H:%M})")
         elif kind == "forecast":
-            self.last = data
+            prev, self.last = self.last, data
             self.fail_count = 0
-            self.show_all(data)
+            try:
+                self.show_all(data)
+            except Exception:
+                self.last = prev                    # seguir enseñando el último bueno
+                if prev:
+                    self.show_all(prev)
+                raise
+            if data.get("offline") and not data.get("forced"):
+                self.forecast_at = time.time() - FORECAST_EVERY_S + 900   # ¿volvió la red?
             self.write_state(data)
             self._status_done()
         elif kind == "done":
@@ -2801,8 +3728,16 @@ class App:
     def _status_done(self):
         nxt = datetime.fromtimestamp(self.forecast_at + FORECAST_EVERY_S, self.tz)
         msg = f"Actualizado {datetime.now(self.tz):%H:%M} · próxima {nxt:%H:%M}"
+        if self.last and self.last.get("offline"):
+            self.set_status(msg + " · SIN CONEXIÓN: pronóstico con "
+                            + ("tu sensor" if self.last["sources"]["sensor"] else "")
+                            + (" y " if all(self.last["sources"].values()) else "")
+                            + ("lo último descargado" if self.last["sources"]["guardado"] else ""), WARN)
+            return
         if self.last:
             msg += f" · {len(self.last['models'])} modelos"
+            if self.last.get("corrected"):
+                msg += " + tu sensor"
         if self.warnings:
             short = "; ".join(w.split(":")[0] for w in self.warnings)
             self.set_status(msg + f" · sin datos de: {short}", WARN)
@@ -2810,13 +3745,17 @@ class App:
             self.set_status(msg)
 
     def _scheduler(self):
-        if self.loc and not self.busy:
-            now = time.time()
-            if now - self.trained_at > RETRAIN_EVERY_S:
-                self.request_update(retrain=True)
-            elif now - self.forecast_at > FORECAST_EVERY_S:
-                self.request_update(retrain=False)
-        self.root.after(30_000, self._scheduler)
+        try:
+            if self.loc and not self.busy:
+                now = time.time()
+                if now - self.trained_at > RETRAIN_EVERY_S:
+                    self.request_update(retrain=True)
+                elif now - self.forecast_at > FORECAST_EVERY_S:
+                    self.request_update(retrain=False)
+        except Exception as e:
+            log(f"ERROR en el programador: {e!r}", "err")
+        finally:
+            self.root.after(30_000, self._scheduler)
 
     # ================================================================ pintar
     def show_all(self, r):
@@ -2832,11 +3771,16 @@ class App:
     def show_now(self, r):
         tz, c = self.tz, r["current"]
         t = c.get("temperature_2m")
+        st = c.get("sensor_temp")
+        model_t = None
+        if st is not None and not r.get("offline"):     # lo medido en tu sitio manda
+            t, model_t = st, t
         self.now_temp.config(text=fmt(t, "{:.1f}", " °C"))
-        self.now_desc.config(text=wmo(c.get("weather_code")))
+        self.now_desc.config(text=c.get("desc") or wmo(c.get("weather_code")))
         feels = c.get("apparent_temperature")
         when = f" · {hhmm(c.get('time'), tz)}" if c.get("time") else ""
-        self.now_feel.config(text=f"Sensación térmica {fmt(feels, '{:.1f}', ' °C')}{when}")
+        sens = f" · medido por tu sensor (el modelo da {model_t:.1f} °C)" if model_t is not None else ""
+        self.now_feel.config(text=f"Sensación térmica {fmt(feels, '{:.1f}', ' °C')}{when}{sens}")
         T = self.now_tiles
         T["hum"].config(text=fmt(c.get("relative_humidity_2m"), suffix=" %"))
         T["dew"].config(text=fmt(c.get("dew_point"), "{:.1f}", " °C"))
@@ -2900,13 +3844,13 @@ class App:
         t0, t1 = r["now"] - 12 * 3600, r["now"] + 48 * 3600
         se = []
         if r["band"]:
-            se.append({"label": "Rango de los modelos", "color": BAND_C, "legend_color": "#3f6e52",
+            se.append({"label": r.get("band_label", "Rango de los modelos"), "color": BAND_C, "legend_color": "#3f6e52",
                        "band": [(t, lo, hi) for t, (lo, hi) in sorted(r["band"].items()) if t <= t1], "pts": []})
         if r["clim"]:
             se.append({"label": "Normal", "color": CLIM_C, "width": 1.5, "dash": (4, 4),
                        "pts": to_pts(r["clim"], t0, t1)})
-        se.append({"label": "Observado", "color": FG, "width": 2, "pts": to_pts(r["obs"], t0, t1)})
-        se.append({"label": "Modelo Pi", "color": PI_C, "width": 3, "pts": to_pts(r["pi"], t0, t1)})
+        se.append({"label": "Medido por tu sensor" if r.get("sensor_obs") else "Observado", "color": FG, "width": 2, "pts": to_pts(r["obs"], t0, t1)})
+        se.append({"label": pi_label(r), "color": PI_C, "width": 3, "pts": to_pts(r["pi"], t0, t1)})
         self.now_chart.show({"kind": "line", "series": se, "xkind": "time", "tz": tz,
                              "xrange": (t0, t1), "now": r["now"], "unit": "°",
                              "title": "Próximas 48 horas (°C) · pasa el ratón para ver cada hora"})
@@ -2934,7 +3878,7 @@ class App:
         t0, t1 = now - 3 * 86400, now + 7 * 86400
         se = []
         if r["band"]:
-            se.append({"label": "Rango de los modelos", "color": BAND_C, "legend_color": "#3f6e52",
+            se.append({"label": r.get("band_label", "Rango de los modelos"), "color": BAND_C, "legend_color": "#3f6e52",
                        "band": [(t, lo, hi) for t, (lo, hi) in sorted(r["band"].items())], "pts": []})
         if r["clim"]:
             se.append({"label": "Normal para la fecha", "color": CLIM_C, "width": 1.5,
@@ -2943,11 +3887,11 @@ class App:
             for k in r["models"]:
                 se.append({"label": NAMES[k].split(" (")[0], "color": COLORS[k], "width": 1,
                            "pts": to_pts(r["temps"][k], t0, t1), "no_legend": False})
-        se.append({"label": "Observado", "color": FG, "width": 2, "pts": to_pts(r["obs"], t0, t1)})
+        se.append({"label": "Medido por tu sensor" if r.get("sensor_obs") else "Observado", "color": FG, "width": 2, "pts": to_pts(r["obs"], t0, t1)})
         if r.get("pi_past"):
             se.append({"label": "Pi predijo (1 día antes)", "color": PI_C, "width": 1.5,
                        "dash": (2, 3), "pts": to_pts(r["pi_past"], t0, t1)})
-        se.append({"label": "Modelo Pi", "color": PI_C, "width": 3, "pts": to_pts(r["pi"], t0, t1)})
+        se.append({"label": pi_label(r), "color": PI_C, "width": 3, "pts": to_pts(r["pi"], t0, t1)})
         self.fc_chart.show({"kind": "line", "series": se, "xkind": "time", "tz": tz,
                             "xrange": (t0, t1), "now": now, "unit": "°",
                             "title": "Temperatura (°C) · últimos 3 días y próximos 7"})
@@ -3144,7 +4088,7 @@ class App:
     # ---------- Precisión
     def show_precision(self, tr):
         leads = sorted(tr["leads"])
-        groups = [f"{L} día" if L == 1 else f"{L} días" for L in leads]
+        groups = ["hoy" if L == 0 else f"{L} día" if L == 1 else f"{L} días" for L in leads]
         avg = {}
         for L in leads:
             for k, v in tr["leads"][L]["mae"].items():
@@ -3168,7 +4112,7 @@ class App:
         label = {"pi": "★ Modelo Pi", "consenso": "Media de modelos", **NAMES}
         l1 = tr["leads"].get(1, tr["leads"][leads[0]])
         for pos, k in enumerate(ranking, 1):
-            vals = [fmt(tr["leads"].get(L, {}).get("mae", {}).get(k), "{:.2f}", "°") for L in (1, 3, 5, 7)]
+            vals = [fmt(tr["leads"].get(L, {}).get("mae", {}).get(k), "{:.2f}", "°") for L in (0, 1, 3, 5, 7)]
             tv.insert("", "end", tags=["best"] if k == "pi" else [], values=(
                 pos, label.get(k, k), *vals,
                 fmt(l1["mae_max"].get(k), "{:.2f}", "°"), fmt(l1["mae_min"].get(k), "{:.2f}", "°")))
@@ -3193,6 +4137,9 @@ class App:
                 if "app" in rivals and best != "app":
                     txt += f" App típica: {rivals['app']:.2f} °C."
                 lines.append(txt)
+        if "q10" in l1:
+            lines.append(f"Margen real a 1 día: 8 de cada 10 horas el Pi acertó con un error entre "
+                         f"{l1['q10']:+.1f} y {l1['q90']:+.1f} °C.")
         f = datetime.fromtimestamp(l1["test_from"], self.tz)
         t = datetime.fromtimestamp(l1["test_to"], self.tz)
         lines.append(f"Prueba justa: del {f:%d/%m/%Y} al {t:%d/%m/%Y}, con datos que el Pi no vio al "
@@ -3224,8 +4171,92 @@ class App:
                                            "values": h["recent"]}]})
 
 
+def backtest(loc=None, out=print):
+    """Prueba de precisión con lo ya descargado en ~/.clima_pi (sin red ni ventana).
+
+    Entrena con el 80 % más antiguo del historial y mide el error en el 20 % más reciente,
+    que el Pi no ha visto. Uso:  python3 clima_pi.py --backtest"""
+    loc = loc or load_config()
+    if not loc:
+        raise RuntimeError("no hay ubicación guardada: abre Clima Pi una vez y elige tu ciudad")
+    d = loc_dir(loc)
+    era5 = _load_json(os.path.join(d, "era5_horario.json"))
+    if not era5:
+        raise RuntimeError("aún no hay historial descargado: deja Clima Pi funcionando una vez")
+    prev, app = {}, None
+    for k, _, ids, _ in MODELS + [APP]:
+        for mid in ids:
+            data = _load_json(os.path.join(d, f"pasados_{k}_{mid}.json"))
+            if data and len(series(data, "hourly", lead_var(1))) > 24 * 45:
+                if k == "app":
+                    app = data
+                else:
+                    prev[k] = data
+                break
+    tr = train(era5, prev, app, get_tz(loc))
+    while not LOG_Q.empty():
+        _, kind, msg = LOG_Q.get_nowait()
+        if kind == "train":
+            out(msg)
+    out("")
+    out(f"Prueba de precisión · {loc_name(loc)} · error medio en °C (más bajo = mejor)")
+    out(f"{'antelación':>11} {'Pi':>6} {'media':>6} {'mejor':>13} {'app':>6} {'normal':>7}"
+        f" {'máx Pi':>7} {'máx mejor':>10} {'mín Pi':>7} {'mín mejor':>10}")
+    for L in sorted(tr["leads"]):
+        i = tr["leads"][L]
+        m = i["mae"]
+        best = min((k for k in m if k in NAMES and k != "app"), key=m.get, default=None)
+        rx = {k: v for k, v in i["mae_max"].items() if k not in ("pi", "clim")}
+        rn = {k: v for k, v in i["mae_min"].items() if k not in ("pi", "clim")}
+        out(f"{L:>9} d {m['pi']:6.2f} {fmt(m.get('consenso'), '{:.2f}'):>6} "
+            f"{SHORT.get(best, best):>8} {fmt(m.get(best), '{:.2f}'):>4} {fmt(m.get('app'), '{:.2f}'):>6} "
+            f"{fmt(m.get('clim'), '{:.2f}'):>7} {fmt(i['mae_max'].get('pi'), '{:.2f}'):>7} "
+            f"{fmt(min(rx.values()) if rx else None, '{:.2f}'):>10} {fmt(i['mae_min'].get('pi'), '{:.2f}'):>7} "
+            f"{fmt(min(rn.values()) if rn else None, '{:.2f}'):>10}")
+    return tr
+
+
+def sensor_test(n=3):
+    """python3 clima_pi.py --sensor-test : lee el DHT22 unas veces y dice qué tal va."""
+    dev, pin = dht_device(), (settings().get("sensor") or {}).get("pin")
+    if not dev and pin is None:
+        print("No encuentro ningún DHT22 (no hace falta para usar Clima Pi).\n"
+              "Para usarlo, conecta el DATA al GPIO 4 (pin 7) con una resistencia de 10 kΩ a 3,3 V,\n"
+              "añade esta línea a /boot/firmware/config.txt y reinicia:\n"
+              "    dtoverlay=dht11,gpiopin=4\n"
+              "(el controlador dht11 de Linux también sirve para el DHT22)")
+        return 1
+    print(f"DHT22 por {'el controlador del sistema (' + dev + ')' if dev else f'Adafruit, GPIO {pin}'}")
+    ok = 0
+    for i in range(n):
+        r = read_sensor()
+        if r:
+            ok += 1
+            print(f"  {r[0]:.1f} °C · {r[1]:.0f} % de humedad · punto de rocío {float(dew_point(*r)):.1f} °C")
+        else:
+            print("  sin lectura (el DHT22 falla a veces; si falla siempre, revisa el cable)")
+        if i < n - 1:
+            time.sleep(2.5)
+    return 0 if ok else 1
+
+
 def main():
     args = sys.argv[1:]
+    if "--backtest" in args:                     # prueba de precisión en la terminal
+        if np is None:
+            sys.exit("Falta numpy: sudo apt install python3-numpy")
+        try:
+            backtest()
+        except RuntimeError as e:
+            sys.exit(f"No se pudo hacer la prueba: {e}")
+        return
+    if "--sensor-test" in args:                  # comprobar el DHT22
+        sys.exit(sensor_test())
+    if "--offline" in args:
+        global OFFLINE_FORCED
+        OFFLINE_FORCED = True
+    if tk is None:
+        sys.exit("Falta tkinter: sudo apt install python3-tk")
     if "--tray" in args:                         # proceso del icono de la barra
         i = args.index("--tray")
         parent = int(args[i + 1]) if i + 1 < len(args) and args[i + 1].isdigit() else None
@@ -3238,23 +4269,36 @@ def main():
         except OSError:
             reply = None
         if reply:
-            running = reply[3:].strip() if reply.startswith("ok ") else "anterior"
+            parts = reply.split()
+            running = parts[1] if len(parts) > 1 else "anterior"
+            pid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
             if running == APP_VERSION:
-                if not background:
-                    send_cmd("show")
+                if background:
+                    return
+                try:
+                    ans = send_cmd("show", timeout=15)
+                except OSError:
+                    ans = None
+                if ans == "ok":
                     print("Clima Pi ya está funcionando; he traído su ventana al frente.")
-                return
-            # hay otra versión funcionando (p. ej. la que arrancó al encender): cerrarla y seguir
-            print(f"Cerrando la versión {running} de Clima Pi para arrancar la {APP_VERSION}…")
-            try:
-                send_cmd("quit")
-            except OSError:
-                pass
-            for _ in range(40):
-                if not instance_running("ping"):
-                    break
-                time.sleep(0.25)
-            time.sleep(1)
+                    return
+                print("La ventana de Clima Pi que está abierta no responde: la cierro y abro otra.")
+                stop_instance(pid)
+            else:
+                # hay otra versión funcionando (p. ej. la que arrancó al encender): cerrarla y seguir
+                print(f"Cerrando la versión {running} de Clima Pi para arrancar la {APP_VERSION}…")
+                try:
+                    send_cmd("quit", timeout=15)
+                except OSError:
+                    pass
+                for _ in range(40):
+                    if not instance_running("ping"):
+                        break
+                    time.sleep(0.25)
+                else:
+                    stop_instance(pid)              # no se cerró por las buenas
+                time.sleep(1)
+    log_to_file()
     root = tk.Tk(className=APP_ID)
     if np is None:
         root.title("Clima Pi")
